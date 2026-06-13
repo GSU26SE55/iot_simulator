@@ -1,0 +1,5 @@
+requests>=2.31.0
+PyYAML>=6.0
+rich>=13.7.0
+paho-mqtt>=2.0.0
+python-dotenv>=1.0.0
