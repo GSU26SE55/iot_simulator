@@ -12,8 +12,8 @@ Backend `BatteryService` đang ở giữa quá trình migrate Sprint IoT-2. Có 
 
 | Mode | Endpoint hoạt động hôm nay | Khi nào dùng |
 |---|---|---|
-| **`current`** (mặc định) | `POST /api/sensor-readings/batch` với `items[].batteryAssetId` (Guid) + `sourceDeviceId`. Header: `X-Api-Key`. KHÔNG có `X-Device-Code`, `Idempotency-Key`, `DeviceTimestamp` wrapper, `SourceType` field. | Backend hôm nay (`backend/docs/api-battery.md §POST /api/sensor-readings/batch`). Yêu cầu `batteries[].battery_asset_id` Guid trong `seed.yaml`. |
-| **`iot2-production`** | `{ DeviceTimestamp, Readings[].BatteryAssetSerial, SourceType, SensorSourceCode, BmsErrorCode }`. Header thêm `X-Device-Code` + `Idempotency-Key`. + endpoint `/api/v1/iot-devices/{provision,heartbeat,firmware-check}`. | Khi Sprint IoT-2 Phase B–C (`#IoT2-04..20`) merge vào dev. Dùng `BatteryAssetSerial` thay Guid. |
+| **`current`** (mặc định) | `POST /api/sensor-readings/batch` với `items[].batteryAssetId` (Guid) **theo Sprint 1 legacy contract** (`tasksprint.md` S1-FW-05 + `newiot.md §7.4`). Header: `X-Api-Key` only. KHÔNG có `sourceDeviceId`, `X-Device-Code`, `Idempotency-Key`, `DeviceTimestamp` wrapper, `SourceType` field. | Backend hôm nay accept legacy. Yêu cầu `batteries[].battery_asset_id` Guid trong `seed.yaml`. |
+| **`iot2-production`** | `{ DeviceTimestamp, Readings[].BatteryAssetSerial, SourceType, SensorSourceCode, BmsErrorCode }`. Header thêm `X-Device-Code` + `Idempotency-Key`. + endpoint `/api/iot-devices/{provision,heartbeat,firmware-check}` (route thực backend, KHÔNG có `/v1/`). | Khi Sprint IoT-2 Phase B–C (`#IoT2-04..20`) merge vào dev. Dùng `BatteryAssetSerial` thay Guid. |
 
 Đổi bằng `backend.contract_version` trong `seed.yaml` hoặc env `IOT_CONTRACT_VERSION=iot2-production`.
 
@@ -137,7 +137,7 @@ make test     # 26/26 PASS
 
 ## Production contract — payload thực tế
 
-### Mode `current` (today)
+### Mode `current` (Sprint 1 legacy — `tasksprint.md` S1-FW-05 + `newiot.md §7.4`)
 
 ```http
 POST /api/sensor-readings/batch
@@ -152,11 +152,13 @@ Content-Type: application/json
     "current":        -1.05,
     "temperature":    29.4,
     "socPercent":     78.5,
-    "cycleCount":     120,
-    "sourceDeviceId": "ESP32-SIM-001"
+    "cycleCount":     120
   }]
 }
 ```
+
+> Mode này khớp **firmware ESP32 Sprint 1** (`capstone/iot/firmware-esp32/src/core/payload.cpp`).
+> Sprint 3 chuyển sang `iot2-production` mode để có wrapper `DeviceTimestamp`, `BatteryAssetSerial`, `SourceType`, `SensorSourceCode`, `Idempotency-Key`.
 
 ### Mode `iot2-production`
 
@@ -218,6 +220,33 @@ Sau khi đối chiếu với `backend/docs/api-battery.md`, đã sửa:
 5. **Cross-source timestamp** — pin `time_iso` per tick để BMS + INA226 + DS18B20 có cùng `Time` (yêu cầu §1.6.6).
 6. **6 scenario thiếu** — thêm `rapid_discharge`, `abnormal_charging`, `soh_degradation`, `high_ambient_temp`, `high_humidity`, `high_temp_humidity_combo`, `fire_detected`, `gas_leak` → đủ 13/15 AnomalyType + 4/6 EnvironmentalIncidentType.
 7. **Battery Guid** — thêm `battery_asset_id` field bắt buộc cho `contract=current`; validator báo lỗi sớm nếu thiếu.
+8. **(2026-06-13) Strict Sprint 1 compliance** — sau khi đối chiếu lại `tasksprint.md` Sprint 1 thật kỹ, sửa 6 điểm cho khớp:
+   - Bỏ `sourceDeviceId` khỏi `current` mode `_bms_to_dict`/`_gw_to_dict` (`newiot.md §7.4` legacy không có field này; Sprint 3 production sẽ có equivalent qua `sensorSourceCode`+`sourceType`).
+   - **Gate `_send_ambient`** (Sprint 5 — S5-FW-06) behind `CONTRACT_IOT2` — Sprint 1 chỉ có mock BMS ingest, KHÔNG có SHT31 ambient.
+   - **Gate `_maybe_trigger_environmental`** (Sprint 6 — S6-FW-01/02) behind `CONTRACT_IOT2` — Sprint 1 KHÔNG có MQ-2 smoke / water leak incident.
+   - `seed.yaml`: `ingest_interval_s` 15 → **5** (khớp S1-FW-07 "Loop chính mỗi 5s").
+   - `seed.yaml`: `batch_size_per_battery` 3 → **1** (firmware Sprint 1 gửi 1 reading/pin/batch).
+   - `seed.yaml`: `initial_soc` 78.5/65 → **30/25** cho 2 pin LiFePO4 12V — đưa voltage `OCV(SOC)` vào dải `12.0..13.0V` theo S1-FW-04 spec ("voltage 12.0–13.0V"). Trước đó voltage 13.15-13.31V (ngoài range).
+
+   > Trong mode `iot2-production`, tất cả tính năng Sprint 2–7 vẫn hoạt động (heartbeat, provision, MQTT, ambient, environmental, firmware-check). User có thể tăng `initial_soc` trở lại nếu muốn test high-SOC scenarios.
+
+9. **(2026-06-14) Sprint 2 alignment với firmware ESP32** — sau khi tôi implement Sprint 2 FW (S2-FW-01..04) cho `iot/firmware-esp32/`, sửa simulator để cùng schema với firmware:
+
+   **HTTP route fix (real bug — đã 404 khi chạy với BE thật):**
+   - **`/api/v1/iot-devices/{provision,heartbeat,firmware-check}` → `/api/iot-devices/...`** — backend thực dùng route KHÔNG có `/v1/` (đã verify trong `services/BatteryService/src/.../IotDevicesController.cs:[Route("api/iot-devices")]`). Sửa cả `src/http_client.py`, `README.md`, `guideline.md` (5 reference). Trước đó simulator gửi tới route `/v1/` → backend trả 404 → provision/heartbeat im lặng fail.
+
+   **Heartbeat body schema (khớp `IotDeviceHeartbeatCommand` + firmware Sprint 2):**
+   - **Bỏ `ConnectedSensorCount`** — KHÔNG có trong backend DTO và firmware ESP32 cũng không gửi. Artifact simulator-only, backend silent ignore.
+   - **Bỏ `IpAddress`** — KHÔNG có trong backend DTO và firmware không gửi.
+   - **Thêm `FreeMemoryPercent`** — Sprint 2 review pass thứ 2 thêm vào firmware vì `MemoryUsageMb` luôn = 0 trên board ESP32-S3 N8 (no PSRAM). Backend command có `decimal? FreeMemoryPercent`.
+   - **Đổi `MemoryUsageMb` từ float → int** — backend field là `long?`. System.Text.Json strict-mode reject float cho integer type. Trước đó `round(x, 1)` = float `156.7` → fix sang `int(round(x))` = `157`.
+
+   > Heartbeat body cuối khớp 1:1 với firmware Sprint 2: `FirmwareVersion`, `Temperature`, `MemoryUsageMb` (int), `FreeMemoryPercent`, `SignalStrengthDbm`, `LocalQueueDepth`, `UptimeSeconds`, `DeviceTimestamp`, `Cpu`=null, `DiskFreeMb`=null.
+
+   **Provision flow — design choice khác (chấp nhận):**
+   - Firmware ESP32: provision **1 lần và persist NVS flag `provd=1`** → idempotent skip lần boot sau.
+   - Simulator: provision **mỗi lần start** (không persist state qua restart) — Python process restart = clean state.
+   - Backend handler `DeviceLifecycleHandlers.cs::Handle(ProvisionIotDeviceCommand)` đã verified idempotent (re-provision device Active vẫn trả OK + config) → cả 2 approach đều work với BE.
 
 ---
 

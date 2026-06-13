@@ -8,8 +8,9 @@ backend:
   tls_verify: false
   contract_version: current               # backend hôm nay (items[].batteryAssetId Guid)
   heartbeat_interval_s: 60
-  ingest_interval_s: 15
-  batch_size_per_battery: 3
+  # Sprint 1 spec (tasksprint S1-FW-07): "Loop chính mỗi 5s ... posted 4 readings (200 OK)"
+  ingest_interval_s: 5
+  batch_size_per_battery: 1               # 1 reading/pin/batch khớp firmware Sprint 1
   retry_base_s: 2
   retry_max_s: 300
   retry_jitter_pct: 20
@@ -32,12 +33,14 @@ devices:
     model: ESP32-WROOM-S3
     api_key: iotk_p-MbplnKWR1VjEVRgbsFMIeTWZsnhx5e86PNNiEkstU
     batteries:
+      # Sprint 1 spec (tasksprint S1-FW-04): "voltage 12.0–13.0V, dao động sine".
+      # SOC 25-30% giữ OCV(SOC) trong dải 12.0-13.0V trên LiFePO4 OCV curve.
       - serial: BAT-2026-001
         battery_asset_id: 54754d04-3c44-4a49-acf2-068cfde936bc
         unit_id: 1
         nominal_voltage: 12.8
         nominal_capacity_ah: 100
-        initial_soc: 78.5
+        initial_soc: 30.0
         initial_soh: 94.2
         cycle_count: 120
         chemistry: LiFePO4
@@ -46,7 +49,7 @@ devices:
         unit_id: 2
         nominal_voltage: 12.8
         nominal_capacity_ah: 100
-        initial_soc: 65.0
+        initial_soc: 25.0
         initial_soh: 88.0
         cycle_count: 245
         chemistry: LiFePO4

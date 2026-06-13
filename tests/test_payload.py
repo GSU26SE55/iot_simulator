@@ -75,22 +75,26 @@ class CurrentContractTest(unittest.TestCase):
         self.assertNotIn("Readings", payload)
         self.assertNotIn("DeviceTimestamp", payload)
 
-    def test_reading_field_names_match_api_battery_md(self):
+    def test_reading_field_names_match_sprint1_legacy(self):
+        """Sprint 1 legacy contract — tasksprint.md S1-FW-05 + newiot.md §7.4."""
         dev = SimulatedDevice(_device_cfg(), _backend(CONTRACT_CURRENT), _mqtt(),
                               Path("/tmp/iot-sim-test"))
         t = pinned_time_iso()
         bms = MockBattery(dev.cfg.batteries[0]).step(15, 0, "normal", t)
         d = dev._bms_to_dict(bms)
-        # field thật của backend hôm nay
+        # Sprint 1 required fields per NI §7.4 legacy + S1-FW-04 mock
         for k in ("batteryAssetId", "time", "voltage", "current",
-                  "temperature", "socPercent", "cycleCount", "sourceDeviceId"):
+                  "temperature", "socPercent", "cycleCount"):
             self.assertIn(k, d, f"thiếu field {k}")
         # batteryAssetId phải là Guid
         self.assertRegex(d["batteryAssetId"], GUID)
-        # KHÔNG có field của contract iot2
+        # KHÔNG có field của contract iot2 (Sprint 3+ production)
         for k in ("BatteryAssetSerial", "SourceType", "SensorSourceCode",
                   "BmsErrorCode", "ChargingState", "SohPercent"):
             self.assertNotIn(k, d, f"không được có field iot2 {k}")
+        # KHÔNG có sourceDeviceId trong Sprint 1 (Sprint 3 sẽ thêm)
+        self.assertNotIn("sourceDeviceId", d,
+                         "Sprint 1 legacy không có sourceDeviceId — newiot.md §7.4")
         # ISO8601 Z
         self.assertRegex(d["time"], ISO_Z)
 
