@@ -181,7 +181,12 @@ class SimulatedDevice:
                 self._tick_ingest(now)
                 last_ingest = now
 
-            if self.cfg.sensors.sht31 and now - last_ambient >= 300:
+            # Ambient (SHT31 → /api/ambient/readings/batch) — Sprint 5 (S5-FW-06).
+            # KHÔNG fire trong contract `current` để giữ strict Sprint 1 scope
+            # (tasksprint S1-FW-04..07 chỉ có mock BMS ingest, không có ambient).
+            if (self.backend_cfg.contract_version == CONTRACT_IOT2
+                    and self.cfg.sensors.sht31
+                    and now - last_ambient >= 300):
                 self._send_ambient(now)
                 last_ambient = now
 
@@ -189,7 +194,10 @@ class SimulatedDevice:
                 self._http.firmware_check(self.cfg.firmware_version)
                 last_fw_check = now
 
-            self._maybe_trigger_environmental(now)
+            # Environmental incident (MQ-2 / water leak → /api/environmental-incidents) — Sprint 6.
+            # KHÔNG fire trong contract `current` để giữ strict Sprint 1 scope.
+            if self.backend_cfg.contract_version == CONTRACT_IOT2:
+                self._maybe_trigger_environmental(now)
 
             time.sleep(0.5)
 
@@ -212,25 +220,27 @@ class SimulatedDevice:
             self.state.status = "online" if res.status_code in (409, 400) else "offline"
             self.state.last_error = f"provision {res.status_code}"
 
-    # heartbeat (60s)
+    # heartbeat (60s) — MO §52.2/§52.4 field mapping (đồng bộ với firmware ESP32 Sprint 2)
     def _send_heartbeat(self, now: float) -> None:
         uptime_s = int(now - self._boot_t)
+        # MemoryUsageMb là long? trong IotDeviceHeartbeatCommand → ép integer,
+        # tránh System.Text.Json strict-mode reject float cho integer type.
+        mem_mb = int(round(random.uniform(120.0, 220.0)))
+        free_heap_total_mb = 320  # ESP32-S3 internal SRAM = 320KB; trên N16R8 + PSRAM 8MB ≈ 8000+
+        free_mem_pct = round((mem_mb / float(free_heap_total_mb)) * 100.0, 2) if free_heap_total_mb else 0.0
         body = {
             "FirmwareVersion": self.cfg.firmware_version,
-            "Temperature": round(35.0 + random.uniform(-2.0, 5.0), 2),
-            "MemoryUsageMb": round(random.uniform(120.0, 220.0), 1),
-            "Cpu": None,                                       # ESP32 — không Linux concept
-            "DiskFreeMb": None,
-            "ConnectedSensorCount": len(self.cfg.batteries) + (
-                (1 if self.cfg.sensors.ina226 else 0)
-                + (1 if self.cfg.sensors.ds18b20 else 0)
-                + (1 if self.cfg.sensors.sht31 else 0)
-            ),
-            "LocalQueueDepth": self._queue.size(),
-            "SignalStrengthDbm": random.randint(-80, -40),
-            "IpAddress": "192.168.1." + str(random.randint(20, 250)),
-            "UptimeSeconds": uptime_s,
+            "Temperature": round(35.0 + random.uniform(-2.0, 5.0), 2),    # decimal? — chip temp °C
+            "MemoryUsageMb": mem_mb,                                       # long?    — int, không float
+            "FreeMemoryPercent": free_mem_pct,                             # decimal? — Sprint 2 review fix
+            "Cpu": None,                                                   # decimal? — ESP32 không Linux CPU
+            "DiskFreeMb": None,                                            # long?    — ESP32 không disk
+            "LocalQueueDepth": self._queue.size(),                         # int?     — alias QueuedReadingCount
+            "SignalStrengthDbm": random.randint(-80, -40),                 # int?     — alias RssiDbm
+            "UptimeSeconds": uptime_s,                                     # long?
             "DeviceTimestamp": _iso_now(skew_min=10 if self.state.scenario == "clock_skew" else 0),
+            # KHÔNG có ConnectedSensorCount + IpAddress: không trong IotDeviceHeartbeatCommand
+            # và không trong spec MO §52.4 (firmware ESP32 cũng không gửi).
         }
         if self._mqtt and self._mqtt.connected:
             if self._mqtt.publish_heartbeat(body):
@@ -439,7 +449,9 @@ class SimulatedDevice:
 
     def _bms_to_dict(self, r: BmsReading) -> dict:
         if self.backend_cfg.contract_version == CONTRACT_CURRENT:
-            # Field shape THẬT của backend api-battery.md §POST /api/sensor-readings/batch
+            # Sprint 1 legacy contract — tasksprint.md S1-FW-05 + newiot.md §7.4:
+            #   "vẫn chấp nhận payload cũ dùng items[].batteryAssetId (legacy mode)"
+            # KHÔNG có sourceDeviceId/sourceType (Sprint 3 production — S3-FW-04).
             return {
                 "batteryAssetId":  r.battery_asset_id,
                 "time":            r.time_iso,
@@ -448,7 +460,6 @@ class SimulatedDevice:
                 "temperature":     r.temperature,
                 "socPercent":      r.soc_percent,
                 "cycleCount":      r.cycle_count,
-                "sourceDeviceId":  self.cfg.device_code,
             }
         # iot2-production
         return {
@@ -468,18 +479,17 @@ class SimulatedDevice:
 
     def _gw_to_dict(self, r: GatewayReading) -> dict:
         if self.backend_cfg.contract_version == CONTRACT_CURRENT:
-            # `current` contract chưa support multi-source — gửi giống reading thường (Voltage/Temperature
-            # có thể null). Field SourceType chưa tồn tại → backend sẽ bỏ qua. Vẫn hợp lệ vì các field
-            # null được backend skip nếu optional.
+            # Sprint 1 legacy contract KHÔNG có sourceType/sensorSourceCode để phân biệt
+            # nguồn (Sprint 3 — S3-FW-04 mới có). Trong mode `current`, INA226/DS18B20
+            # reading được flatten thành reading thường (Sprint 5+ thì dùng `iot2-production`).
             return {
                 "batteryAssetId":  r.battery_asset_id,
                 "time":            r.time_iso,
                 "voltage":         r.voltage if r.voltage is not None else 0.0,
                 "current":         r.current if r.current is not None else 0.0,
                 "temperature":     r.temperature if r.temperature is not None else 0.0,
-                "socPercent":      0.0,                                   # required field; redundant không biết SOC → 0
+                "socPercent":      0.0,                                   # required; redundant không biết SOC → 0
                 "cycleCount":      0,
-                "sourceDeviceId":  f"{self.cfg.device_code}:{r.sensor_source_code}",
             }
         return {
             "BatteryAssetSerial": r.battery_serial,

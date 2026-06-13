@@ -305,10 +305,10 @@ Mở file và điền:
 backend:
   base_url: http://localhost:4001          # ApiGateway
   tls_verify: false
-  contract_version: current                # đang dùng contract TODAY
+  contract_version: current                # đang dùng contract TODAY (Sprint 1 legacy NI §7.4)
   heartbeat_interval_s: 60
-  ingest_interval_s: 15                    # poll mỗi 15s
-  batch_size_per_battery: 3
+  ingest_interval_s: 5                     # Sprint 1 S1-FW-07: "mỗi 5s"
+  batch_size_per_battery: 1                # Sprint 1 firmware: 1 reading/pin/batch
   retry_base_s: 2
   retry_max_s: 300
   retry_jitter_pct: 20
@@ -321,12 +321,13 @@ devices:
     site_id_guid: b6d83be5-050c-47a0-9f73-3160f517be80    # ← từ Bước 4.2
     api_key: iotk_<rawApiKey từ Bước 4.4>                 # ← key của ESP32-SIM-001
     batteries:
+      # Sprint 1 S1-FW-04: voltage 12.0–13.0V → SOC 25-30% giữ OCV trong dải đó.
       - serial: BAT-2026-001
         battery_asset_id: 54754d04-3c44-4a49-acf2-068cfde936bc   # ← Bước 4.3
         unit_id: 1
         nominal_voltage: 12.8
         nominal_capacity_ah: 100
-        initial_soc: 78.5
+        initial_soc: 30.0
         initial_soh: 94.2
         cycle_count: 120
         chemistry: LiFePO4
@@ -558,7 +559,7 @@ GROUP BY 1 ORDER BY 1;\""
 ### B1 — Provision flow (chỉ contract iot2)
 
 ```bash
-# Mode iot2-production sẽ tự gọi POST /api/v1/iot-devices/provision khi boot
+# Mode iot2-production sẽ tự gọi POST /api/iot-devices/provision khi boot
 .venv/bin/python -m src.main --no-dashboard 2>&1 | grep provision
 ```
 
@@ -686,7 +687,7 @@ JWT chỉ sống 1 giờ. Login lại Bước 4.1.
 
 ```
 boot
-  ├── (iot2-production) POST /api/v1/iot-devices/provision  ← 1 lần
+  ├── (iot2-production) POST /api/iot-devices/provision  ← 1 lần
   └── loop:
        ├── mỗi `ingest_interval_s` (15s):
        │     read BMS từng pin (multi-drop simulate)
@@ -698,13 +699,13 @@ boot
        │       └── lỗi → enqueue + exponential backoff
        │
        ├── mỗi `heartbeat_interval_s` (60s) [iot2-only]:
-       │     POST /api/v1/iot-devices/heartbeat
+       │     POST /api/iot-devices/heartbeat
        │
        ├── mỗi 5 phút (SHT31 enabled):
        │     POST /api/ambient/readings/batch
        │
        ├── mỗi 6 giờ [iot2-only]:
-       │     GET /api/v1/iot-devices/firmware-check
+       │     GET /api/iot-devices/firmware-check
        │
        └── scenario triggers:
              smoke/fire/gas/water_leak → POST /api/environmental-incidents
@@ -721,7 +722,7 @@ boot
 | Reading shape | `batteryAssetId` Guid + `sourceDeviceId` | `BatteryAssetSerial` + `SourceType` + `SensorSourceCode` + `BmsErrorCode` |
 | Header | `X-Api-Key` only | thêm `X-Device-Code` + `Idempotency-Key` (UUIDv4) |
 | Multi-source/tick (BMS+INA226+DS18B20) | KHÔNG (PK collision) | CÓ (`SourceType` vào composite PK) |
-| Provision/heartbeat endpoint | chưa có | `/api/v1/iot-devices/{provision,heartbeat,firmware-check}` |
+| Provision/heartbeat endpoint | chưa có | `/api/iot-devices/{provision,heartbeat,firmware-check}` |
 | Cross-source SensorMismatch | chưa demo được | demo được |
 | Clock skew reject | chưa enforce | reject ở Sprint #IoT2-15 |
 

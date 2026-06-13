@@ -11,9 +11,9 @@ Hỗ trợ 2 contract version:
 
   `iot2-production`   — endpoint Sprint IoT-2 (#IoT2-14..20):
       POST /api/sensor-readings/batch        header thêm X-Device-Code + Idempotency-Key
-      POST /api/v1/iot-devices/provision     header X-Device-Code + X-Api-Key
-      POST /api/v1/iot-devices/heartbeat     header X-Device-Code + X-Api-Key
-      GET  /api/v1/iot-devices/firmware-check
+      POST /api/iot-devices/provision     header X-Device-Code + X-Api-Key
+      POST /api/iot-devices/heartbeat     header X-Device-Code + X-Api-Key
+      GET  /api/iot-devices/firmware-check
 """
 from __future__ import annotations
 
@@ -68,11 +68,11 @@ class IotHttpClient:
             "HardwareRevision": hardware_revision,
             "DeviceTimestamp": device_timestamp_iso,
         }
-        return self._post("/api/v1/iot-devices/provision", body)
+        return self._post("/api/iot-devices/provision", body)
 
     # ─────────────── Heartbeat (Sprint IoT-2 #IoT2-10, §52.4) ───────────────
     def heartbeat(self, body: dict) -> HttpResult:
-        return self._post("/api/v1/iot-devices/heartbeat", body)
+        return self._post("/api/iot-devices/heartbeat", body)
 
     # ─────────────── Sensor ingest ───────────────
     def ingest(self, payload: dict, idempotency_key: str | None) -> HttpResult:
@@ -95,7 +95,7 @@ class IotHttpClient:
 
     # ─────────────── Firmware OTA check (Sprint IoT-2 #IoT2-35, §52.7) ──────
     def firmware_check(self, current_version: str) -> HttpResult:
-        url = f"{self.base_url}/api/v1/iot-devices/firmware-check"
+        url = f"{self.base_url}/api/iot-devices/firmware-check"
         try:
             r = self.session.get(url, params={"currentVersion": current_version}, timeout=10)
             return self._wrap(r)
