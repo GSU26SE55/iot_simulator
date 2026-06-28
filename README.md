@@ -13,7 +13,7 @@ Backend `BatteryService` đang ở giữa quá trình migrate Sprint IoT-2. Có 
 | Mode | Endpoint hoạt động hôm nay | Khi nào dùng |
 |---|---|---|
 | **`current`** (mặc định) | `POST /api/sensor-readings/batch` với `items[].batteryAssetId` (Guid) **theo Sprint 1 legacy contract** (`tasksprint.md` S1-FW-05 + `newiot.md §7.4`). Header: `X-Api-Key` only. KHÔNG có `sourceDeviceId`, `X-Device-Code`, `Idempotency-Key`, `DeviceTimestamp` wrapper, `SourceType` field. | Backend hôm nay accept legacy. Yêu cầu `batteries[].battery_asset_id` Guid trong `seed.yaml`. |
-| **`iot2-production`** | `{ DeviceTimestamp, Readings[].BatteryAssetSerial, SourceType, SensorSourceCode, BmsErrorCode }`. Header thêm `X-Device-Code` + `Idempotency-Key`. + endpoint `/api/iot-devices/{provision,heartbeat,firmware-check}` (route thực backend, KHÔNG có `/v1/`). | Khi Sprint IoT-2 Phase B–C (`#IoT2-04..20`) merge vào dev. Dùng `BatteryAssetSerial` thay Guid. |
+| **`iot2-production`** | `{ items[]: { batteryAssetSerial, time, deviceTimestamp, voltage, current, temperature, socPercent, cycleCount, sourceType, sensorSourceCode, sohPercent?, chargingState?, bmsErrorCode? } }` — **KHỚP firmware `buildProductionBatchPayload`**. Header thêm `X-Device-Code` + `Idempotency-Key`. + endpoint `/api/iot-devices/{provision,heartbeat,firmware-check,firmware-update-log}` + MQTT per-pin. | Production contract (S3-FW-04). Dùng `batteryAssetSerial` thay Guid. ⚠ Xem audit #10 — backend còn 1 bug idempotency chặn ingest. |
 
 Đổi bằng `backend.contract_version` trong `seed.yaml` hoặc env `IOT_CONTRACT_VERSION=iot2-production`.
 
@@ -40,14 +40,16 @@ iot-simulator/
 │   │   ├── redundant.py     ← INA226 (V/I) + DS18B20 (temp) — sourceType=IotGateway
 │   │   ├── ambient.py       ← SHT31 → /api/ambient/readings/batch  (source=1 IotSensor)
 │   │   └── environmental.py ← MQ-2 smoke / fire / gas leak + water flood → /api/environmental-incidents (int enums)
-│   ├── http_client.py       ← HTTPS REST — chuyển header & path tự động theo contract_version
-│   ├── mqtt_client.py       ← MQTT (paho-mqtt) — LWT + telemetry/heartbeat/status/cmd/cmd-ack
+│   ├── http_client.py       ← HTTPS REST — header & path theo contract + firmware-update-log PUT
+│   ├── mqtt_client.py       ← MQTT (paho-mqtt) — LWT + telemetry per-pin/heartbeat/status/cmd/cmd-ack
 │   ├── queue.py             ← Local JSONL queue + endpoint routing khi flush
-│   ├── device.py            ← SimulatedDevice — vòng đời ESP32 + scenarios + cmd downlink
-│   └── dashboard.py         ← Rich live dashboard
-├── tests/  (26 tests — 100% PASS)
+│   ├── ota.py               ← OTA decision (ota_should_update) + runner lifecycle (S7)
+│   ├── device.py            ← SimulatedDevice — vòng đời ESP32 + scenarios + cmd downlink + OTA + LED
+│   └── dashboard.py         ← Rich live dashboard (LED + FW + OTA cols)
+├── tests/  (44 tests — 100% PASS)
 │   ├── test_bms.py          ← 11 scenarios + pinned timestamp + ChargingState enum
-│   └── test_payload.py      ← cả 2 contract + cross-source + ambient + incident enums
+│   ├── test_payload.py      ← cả 2 contract (items[] camelCase) + cross-source + ambient + incident
+│   └── test_features.py     ← MQTT topic/command schema + provision-apply + OTA decision/lifecycle
 └── logs/queue/              ← JSONL per device (auto-create)
 ```
 
@@ -64,7 +66,7 @@ iot-simulator/
 | **S3-FW-02** Idempotency-Key UUIDv4 | `device._tick_ingest` gen `uuid.uuid4()`; chỉ gửi nếu contract iot2 |
 | **S3-FW-03** exponential backoff + jitter | `device._bump_backoff` (base 2s, max 300s, jitter ±20%) |
 | **S3-FW-04** production contract `deviceTimestamp` + `sourceType` per-source + `bmsErrorCode ≤64 chars` | `device._build_ingest_payload` + `_bms_to_dict` + `_gw_to_dict` |
-| **S4-FW-01..06** MQTT + LWT + cmd subscribe + cmd/ack publish + fallback HTTPS | `mqtt_client.py` + `device._on_mqtt_command` |
+| **S4-FW-01..06** MQTT + LWT + cmd subscribe + cmd/ack publish + fallback HTTPS | `mqtt_client.py` (telemetry per-pin `solar/{dev}/{serial}/telemetry`) + `device._on_mqtt_command` (schema `{cmdId,type,params}` → ack `{cmdId,status,error?}`) + MQTT-first streak threshold=3 |
 | **S5-FW-01** BMS reading + `bmsErrorCode` | `bms.py` (OVP/UVP/OTP/OCD/scenario `bms_error`) |
 | **S5-FW-04** INA226 `sourceType=2/redundant` | `sensors/redundant.make_ina226_reading` |
 | **S5-FW-05** DS18B20 `sourceType=2/external-temp` | `sensors/redundant.make_ds18b20_reading` |
@@ -72,7 +74,9 @@ iot-simulator/
 | **S6-FW-01** MQ-2 → environmental incident | `sensors/environmental.make_smoke_incident` (int enum) |
 | **S6-FW-02** water leak → flood incident | `make_water_leak_incident` → `incidentType=4` (Flood) |
 | **S6-FW-03** cross-source pair BMS vs IotGateway cùng phút | pinned `time_iso` per tick — verified bởi `test_pinned_timestamp_across_sources` |
-| **S7-FW-01** firmware-check polling | `http_client.firmware_check` mỗi 6h |
+| **S7-FW-01/02** OTA: firmware-check → decision → update-log lifecycle → version bump | `ota.py` (`ota_should_update` + `OtaRunner`) + `device._do_ota_check` mỗi 1h (firmware `OTA_CHECK_INTERVAL_MS`); `trigger_ota` cmd chạy ngay |
+| **S2-FW-02** provision response apply (polling/heartbeat/siteId/ntp) | `device._apply_provision_response` (siteId backend-assigned override seed) |
+| **LedState** Online/Queued/Offline/Provisioning | `device._update_led` + `dashboard` cột LED |
 | **ChargingStateEnum** Idle/Charging/Discharging/Float/Bypass = 1..5 | `bms.py` (sửa từ Full=4 → Float=4) |
 
 ---
@@ -160,7 +164,7 @@ Content-Type: application/json
 > Mode này khớp **firmware ESP32 Sprint 1** (`capstone/iot/firmware-esp32/src/core/payload.cpp`).
 > Sprint 3 chuyển sang `iot2-production` mode để có wrapper `DeviceTimestamp`, `BatteryAssetSerial`, `SourceType`, `SensorSourceCode`, `Idempotency-Key`.
 
-### Mode `iot2-production`
+### Mode `iot2-production` — KHỚP firmware `buildProductionBatchPayload` (S3-FW-04)
 
 ```http
 POST /api/sensor-readings/batch
@@ -169,18 +173,30 @@ X-Device-Code: ESP32-SIM-001
 Idempotency-Key: <uuidv4>
 
 {
-  "DeviceTimestamp": "2026-06-12T10:15:30Z",
-  "Readings": [
-    { "BatteryAssetSerial": "BAT-2026-001", "Time": "2026-06-12T10:15:30Z",
-      "Voltage": 12.94, "Current": -1.05, "Temperature": 29.4,
-      "SocPercent": 78.5, "SohPercent": 94.2, "CycleCount": 120,
-      "ChargingState": 3, "BmsErrorCode": null,
-      "SourceType": 1, "SensorSourceCode": "primary" },
-    { "...": "INA226: SourceType=2, SensorSourceCode=redundant, Temperature=null" },
-    { "...": "DS18B20: SourceType=2, SensorSourceCode=external-temp, Voltage=null" }
+  "items": [
+    { "batteryAssetSerial": "BAT-2026-001",
+      "time": "2026-06-12T10:15:30.000Z", "deviceTimestamp": "2026-06-12T10:15:30.000Z",
+      "voltage": 12.94, "current": -1.05, "temperature": 29.4,
+      "socPercent": 78.5, "cycleCount": 120,
+      "sourceType": 1, "sensorSourceCode": "primary",
+      "sohPercent": 94.2, "chargingState": 3 },
+    { "batteryAssetSerial": "BAT-2026-001",
+      "time": "2026-06-12T10:15:30.001Z", "deviceTimestamp": "2026-06-12T10:15:30.000Z",
+      "voltage": 12.99, "current": -1.04, "temperature": 0.0, "socPercent": 0.0, "cycleCount": 0,
+      "sourceType": 2, "sensorSourceCode": "redundant" },
+    { "batteryAssetSerial": "BAT-2026-001",
+      "time": "2026-06-12T10:15:30.002Z", "deviceTimestamp": "2026-06-12T10:15:30.000Z",
+      "voltage": 0.0, "current": 0.0, "temperature": 35.1, "socPercent": 0.0, "cycleCount": 0,
+      "sourceType": 2, "sensorSourceCode": "external-temp" }
   ]
 }
 ```
+
+> ⚠ KHÔNG có wrapper `DeviceTimestamp`/`Readings`. Backend `BatchIngestSensorReadingsCommand`
+> chỉ bind `List<SensorReadingItem> Items` (camelCase). `time` stagger theo ms PER-SOURCE để
+> tránh trùng PK hypertable `(Time, BatteryAssetId)` (backend khuyến nghị ms-resolution;
+> `CrossSourceValidationService` ghép cặp theo cửa sổ 60s nên lệch ms vẫn pair đúng).
+> `deviceTimestamp` giữ nguyên 1 mốc/tick cho clock-skew check (#IoT2-15).
 
 ### Ambient (`/api/ambient/readings/batch`)
 
@@ -247,6 +263,35 @@ Sau khi đối chiếu với `backend/docs/api-battery.md`, đã sửa:
    - Firmware ESP32: provision **1 lần và persist NVS flag `provd=1`** → idempotent skip lần boot sau.
    - Simulator: provision **mỗi lần start** (không persist state qua restart) — Python process restart = clean state.
    - Backend handler `DeviceLifecycleHandlers.cs::Handle(ProvisionIotDeviceCommand)` đã verified idempotent (re-provision device Active vẫn trả OK + config) → cả 2 approach đều work với BE.
+
+10. **(2026-06-26) Full parity với firmware ESP32 "complete" (commit `ec68591`)** — sau khi đọc lại TOÀN BỘ `iot/firmware-esp32/src/` (13 module) + verify trực tiếp DTO backend, sửa các điểm lệch giữa simulator và firmware đã hoàn thiện:
+
+    **🔴 Production ingest contract — bug đúng/sai (sẽ bị backend 400):**
+    - Trước: `iot2-production` gửi `{ "DeviceTimestamp": ..., "Readings": [{ PascalCase }] }`.
+    - Backend `BatchIngestSensorReadingsCommand` chỉ bind `List<SensorReadingItem> Items` — KHÔNG có wrapper → `Items` rỗng → 400 "Danh sách readings là bắt buộc". Firmware `core/payload.cpp::buildProductionBatchPayload` gửi `{ "items": [{ camelCase, deviceTimestamp per-item, sourceType, sensorSourceCode, sohPercent?, chargingState?, bmsErrorCode? }] }`.
+    - **Đã viết lại** `_build_ingest_payload`/`_bms_to_dict`/`_gw_to_dict` khớp 1:1 firmware + backend DTO. Gateway (INA226/DS18B20) emit `0.0` cho field không đo (backend Voltage/Current/Temperature non-nullable decimal). Sửa 3 unit test assert contract cũ sai.
+
+    **🟠 MQTT (S4) — khớp `net/mqtt_client.cpp` + `cmd/`:**
+    - Telemetry topic `solar/{siteId}/{dev}/telemetry` (cả batch) → `solar/{dev}/{serial}/telemetry` **per-pin** (firmware `mqttPublishTelemetry` group-by-serial). Broker ACL `solar/%u/+/telemetry`.
+    - Command schema `{action, value}` → `{cmdId, type, params.pollingSeconds|pollingIntervalSeconds}`; ack `{cmdId, status, message}` → `{cmdId, status, error?}` (firmware `cmd_logic.cpp` + `command_handler.cpp`). type case-insensitive + `_`/`-`. Thêm MQTT-first streak threshold=3 + reset khi reconnect (S4-FW-06).
+
+    **🟠 Provision/Heartbeat/OTA-check:**
+    - `_do_provision` giờ parse `CommonResponse.data` → áp dụng `pollingIntervalSeconds`/`heartbeatIntervalSeconds`/`siteId`/`ntpServer` (firmware `provision.cpp`). **siteId backend-assigned override seed** → ambient + environmental incident dùng đúng site.
+    - Heartbeat **HTTP-only** (firmware `heartbeat.cpp::sendOnce` dùng `httpPostJson`, KHÔNG qua MQTT). Trước simulator ưu tiên MQTT.
+    - firmware-check `6h → 1h` (firmware `OTA_CHECK_INTERVAL_MS = 3600000`).
+
+    **🟡 Tính năng mới (firmware có, simulator thiếu):**
+    - **OTA Sprint 7** (`src/ota.py`): `ota_should_update` (so version chuỗi tuyệt đối — `ota_decision.h`) + `OtaRunner` lifecycle `firmware-check → PUT firmware-update-log {Downloading→Installing→Success} → bump version`. `trigger_ota` cmd chạy thật 1 chu kỳ. (Không tải .bin/SHA/rollback partition — cần hardware thật.)
+    - **LED state** Online/Queued/Offline/Provisioning (`led_palette.h`) trên dashboard.
+
+    **⚠ Phát hiện BUG BACKEND (chặn iot2 ingest — KHÔNG phải lỗi simulator):**
+    - Verify trực tiếp với BE dev đang chạy (`:4001`): legacy `current` ingest ✅ persist (sent=1); iot2 provision/heartbeat/firmware-check ✅ 200. NHƯNG iot2 **sensor-readings/batch ingest → 500**:
+      `23505: duplicate key value violates unique constraint "PK_sensor_ingest_idempotency_records"`.
+    - Root cause: `SensorIngestIdempotencyRecord.Id` **không được sinh** → mọi insert dùng `id = 00000000-...-000000000000`. Insert ĐẦU TIÊN ok, mọi insert sau trùng PK Guid.Empty. DB xác nhận có đúng 1 row id=Guid.Empty.
+    - File: `backend/.../CQRS/Handler/SensorReading/BatchIngestSensorReadingsCommandHandler.cs` (~dòng 348) — `new SensorIngestIdempotencyRecord { ... }` thiếu `Id = Guid.NewGuid()` (hoặc cấu hình `ValueGeneratedOnAdd`).
+    - **Firmware thật cũng dính** (luôn gửi `Idempotency-Key` cho ingest). Simulator gửi đúng UUID key + `X-Device-Code` theo contract → đã đúng; queue+backoff xử lý 500 mượt. Cần fix backend ở repo backend (ngoài scope task simulator này).
+
+    > Tóm tắt verify (BE dev `:4001`): provision 200 ✅ · heartbeat 200 ✅ · firmware-check 200 ✅ · legacy ingest persist ✅ · iot2 ingest blocked-by-BE-bug ⚠ · 44/44 unit test ✅.
 
 ---
 

@@ -25,11 +25,25 @@ def _scenario_color(scenario: str) -> str:
     return "magenta"
 
 
+def _led_render(led: str) -> str:
+    # Khớp firmware led_palette.h: Online=xanh, Queued=vàng, Offline=đỏ, Provisioning=tím.
+    color = {
+        "Online":       "green",
+        "Queued":       "yellow",
+        "Offline":      "red",
+        "Provisioning": "magenta",
+    }.get(led, "white")
+    return f"[{color}]●[/] {led}"
+
+
 def render_table(devices: list[SimulatedDevice]) -> Table:
     t = Table(title="IoT Simulator — Live State", expand=True)
     t.add_column("Device", style="cyan", no_wrap=True)
+    t.add_column("LED", no_wrap=True)
     t.add_column("Status")
     t.add_column("Scenario")
+    t.add_column("FW", style="dim", no_wrap=True)
+    t.add_column("OTA", justify="right", style="blue")
     t.add_column("Batt", justify="right")
     t.add_column("V", justify="right")
     t.add_column("T°C", justify="right")
@@ -47,8 +61,11 @@ def render_table(devices: list[SimulatedDevice]) -> Table:
         s = d.state
         t.add_row(
             d.cfg.device_code,
+            _led_render(s.led),
             f"[{_status_color(s.status)}]{s.status}[/]",
             f"[{_scenario_color(s.scenario)}]{s.scenario}[/]",
+            s.firmware_version or d.cfg.firmware_version,
+            f"{s.ota_updates}/{s.ota_checks}",
             str(len(d.cfg.batteries)),
             f"{s.last_voltage:.2f}",
             f"{s.last_temperature:.1f}",

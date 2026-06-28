@@ -93,7 +93,9 @@ class IotHttpClient:
     def environmental_incident(self, payload: dict) -> HttpResult:
         return self._post("/api/environmental-incidents", payload)
 
-    # ─────────────── Firmware OTA check (Sprint IoT-2 #IoT2-35, §52.7) ──────
+    # ─────────────── Firmware OTA check (Sprint 7 — S7-FW-01, §52.7) ────────
+    # Backend route: GET /api/iot-devices/firmware-check?currentVersion=...
+    # (khớp firmware ota_update.cpp::doCheckAndApply + IotDevicesController.FirmwareCheck)
     def firmware_check(self, current_version: str) -> HttpResult:
         url = f"{self.base_url}/api/iot-devices/firmware-check"
         try:
@@ -101,6 +103,28 @@ class IotHttpClient:
             return self._wrap(r)
         except requests.RequestException as ex:
             log.warning("firmware_check FAIL: %s", ex)
+            return HttpResult(ok=False, status_code=0, body=str(ex))
+
+    # ─────────────── Firmware update-log PUT (Sprint 7 — S7-FW-02) ──────────
+    # Backend route: PUT /api/iot-devices/firmware-update-log/{id:guid}
+    # Body: { status:int, bytesDownloaded?:long, failureReason?:string<=500 }
+    # status enum IotFirmwareUpdateStatusEnum: Pending=1 Downloading=2 Installing=3
+    #   Success=4 Failed=5 Skipped=6 (RolledBack=7 firmware-only).
+    # (khớp firmware ota_update.cpp::putLog)
+    def firmware_update_log(self, log_id: str, status: int,
+                            bytes_downloaded: int | None = None,
+                            failure_reason: str | None = None) -> HttpResult:
+        body: dict = {"status": status}
+        if bytes_downloaded is not None and bytes_downloaded > 0:
+            body["bytesDownloaded"] = bytes_downloaded
+        if failure_reason:
+            body["failureReason"] = failure_reason[:500]
+        url = f"{self.base_url}/api/iot-devices/firmware-update-log/{log_id}"
+        try:
+            r = self.session.put(url, data=json.dumps(body), timeout=15)
+            return self._wrap(r)
+        except requests.RequestException as ex:
+            log.warning("firmware_update_log FAIL: %s", ex)
             return HttpResult(ok=False, status_code=0, body=str(ex))
 
     # ─────────────── helpers ───────────────
