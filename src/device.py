@@ -317,10 +317,13 @@ class SimulatedDevice:
         groups: dict[str, list[dict]] = {}
 
         for bat in self._batteries.values():
+            # Scenario per-battery (bat.cfg.scenario) override scenario device. Cho phép
+            # 2 pin cùng device chạy 2 kịch bản khác nhau. "" → kế thừa device.
+            bat_scenario = bat.cfg.scenario or self.state.scenario
             bms = bat.step(
                 dt_s=float(self.backend_cfg.ingest_interval_s),
                 t_global=now,
-                scenario=self.state.scenario,
+                scenario=bat_scenario,
                 time_iso=tick_time_iso,
             )
             self.state.last_voltage = bms.voltage
@@ -335,10 +338,10 @@ class SimulatedDevice:
             if self.backend_cfg.contract_version == CONTRACT_IOT2:
                 if self.cfg.sensors.ina226:
                     grp.append(self._gw_to_dict(
-                        make_ina226_reading(bms, self.cfg.sensor_drift, self.state.scenario)))
+                        make_ina226_reading(bms, self.cfg.sensor_drift, bat_scenario)))
                 if self.cfg.sensors.ds18b20:
                     grp.append(self._gw_to_dict(
-                        make_ds18b20_reading(bms, self.cfg.sensor_drift, self.state.scenario)))
+                        make_ds18b20_reading(bms, self.cfg.sensor_drift, bat_scenario)))
 
         if not groups:
             return

@@ -117,7 +117,12 @@ class MockBattery:
         heat = (current * current) * 0.15
         temperature = self.ambient_c + heat + 1.5 * math.sin(t_global / 180.0) + random.uniform(-0.3, 0.3)
         if scenario == "overheat":
-            self._scenario_temp_offset = min(self._scenario_temp_offset + dt_s * 0.15, 35.0)
+            # Ramp nhanh để vượt ngưỡng TemperatureMax (~45–50°C per battery-type) trong
+            # ~30–60s demo: seed +8°C ngay tick đầu rồi +4.5°C/s (dt=5s → +22.5°C/tick),
+            # cap +40°C. Với ambient ~28°C + heat → chạm ~55°C sau 1–2 tick.
+            if self._scenario_temp_offset == 0.0:
+                self._scenario_temp_offset = 8.0
+            self._scenario_temp_offset = min(self._scenario_temp_offset + dt_s * 4.5, 40.0)
             temperature += self._scenario_temp_offset
         temperature = round(temperature, 2)
 

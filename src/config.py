@@ -41,6 +41,9 @@ class BatteryConfig:
     # Guid của BatteryAsset trong DB backend — BẮT BUỘC khi contract_version=current vì
     # backend chấp nhận `items[].batteryAssetId` Guid (chưa biết mapping serial → assetId).
     battery_asset_id: str = ""
+    # Scenario riêng cho từng pin (override scenario của device). "" = kế thừa device.
+    # Cho phép 2 pin cùng 1 device chạy 2 kịch bản khác nhau (vd 1 pin normal, 1 pin overheat).
+    scenario: str = ""
 
 
 @dataclass
