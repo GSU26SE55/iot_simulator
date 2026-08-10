@@ -1,33 +1,190 @@
-# Seed data cho IoT Simulator — phủ ĐỦ scope test (cập nhật 2026-06-27)
-#   Site A: Solar Farm Long An  (b6d83be5-050c-47a0-9f73-3160f517be80) → BAT-001/002/003/004
-#   Site B: Solar Farm Da Nang  (0bbfff66-2697-4205-bddc-5593b457d7bc) → BAT-005/007
-#   Site-less (SiteId=null): BAT-006 (cust c673c925) · BAT-008/009 (cust.demo e2e46e9c → test Customer login)
-#   Types: LiFePO4(cb3c6312) · NMC(96856d6b) · NCA(1970a0c1)
-#   3 device: ESP32-SIM-001/002 (per-device key, Site A) + ESP32-SIM-003 (GLOBAL key → mọi pin)
-#   → test được: asset · assets · customer · site · sites · type · all · site:none
+# Seed cho IoT Simulator.
+#
+# ⚠ ĐÂY CHỈ LÀ ĐƯỜNG LUI — vai trò giống `firmware-esp32/include/config.h` bên repo `iot`.
+#   Từ khi simulator đọc đủ provision response, NGUỒN CHÂN LÝ của các giá trị dưới đây là BACKEND:
+#     · pollingIntervalSeconds / heartbeatIntervalSeconds / siteId / ntpServer
+#     · 6 trường MQTT (host, port, tls, topicPrefix, username, password)   ← IOT3-42
+#     · batteryMappings[] (serial ↔ unitId ↔ sensorSourceCode)             ← IOT3-49
+#   Chúng được lưu bền vững ở `logs/state/<device_code>.nvs.json` (tương đương NVS của ESP32) và
+#   ghi đè seed ngay khi có. Muốn quay về trạng thái "thiết bị mới bóc hộp":
+#       python -m src.main --clear-state
+#
+#   Seed ở đây dùng cho: lần chạy ĐẦU TIÊN (chưa provision), và bảng pin dự phòng khi backend
+#   không trả `batteryMappings[]`.
+#
+# Site A: Solar Farm Long An  (b6d83be5-050c-47a0-9f73-3160f517be80) → BAT-001/002/003/004
+# Site B: Solar Farm Da Nang  (0bbfff66-2697-4205-bddc-5593b457d7bc) → BAT-005/007
+# Không thuộc site nào: BAT-006 · BAT-008/009 (test scope Customer)
 
 backend:
-  base_url: http://localhost:4001         # ApiGateway (HTTP, không phải HTTPS)
+  base_url: http://localhost:4001         # ApiGateway
   tls_verify: false
-  contract_version: current               # backend hôm nay (items[].batteryAssetId Guid)
-  heartbeat_interval_s: 60
-  # Sprint 1 spec (tasksprint S1-FW-07): "Loop chính mỗi 5s ... posted 4 readings (200 OK)"
-  ingest_interval_s: 5
-  batch_size_per_battery: 1               # 1 reading/pin/batch khớp firmware Sprint 1
+
+  # ⚠ `iot2-production` là contract DUY NHẤT mà firmware ESP32 thật chạy, và là contract có ĐỦ
+  #   tính năng: provision, heartbeat, MQTT, ambient, environmental-incident, OTA, Idempotency-Key.
+  #   Đổi về `current` nếu backend của bạn còn là bản Sprint 1 (chỉ có POST /api/sensor-readings
+  #   /batch với items[].batteryAssetId Guid) — khi đó mọi tính năng trên tự TẮT.
+  contract_version: iot2-production
+
+  heartbeat_interval_s: 60                # đường lui; provision response sẽ ghi đè
+  ingest_interval_s: 5                    # đường lui; provision response sẽ ghi đè
+  batch_size_per_battery: 3               # BMS + INA226 + DS18B20
+  http_timeout_s: 15
+
+  # Backoff — khớp `net/backoff.h`: base 2s, trần 5 phút, jitter ±20%.
   retry_base_s: 2
   retry_max_s: 300
   retry_jitter_pct: 20
 
+  # OTA — khớp `include/config.h` (S7-FW-01/02).
+  ota_enabled: true
+  ota_check_interval_s: 3600              # OTA_CHECK_INTERVAL_MS  = 1h
+  ota_warmup_s: 30                        # chờ mạng/giờ/provision ổn định sau boot
+  ota_health_timeout_s: 120               # OTA_HEALTH_TIMEOUT_MS  = 2' rồi rollback
+  ota_download_timeout_s: 20              # OTA_HTTP_TIMEOUT_MS
+  ota_max_boot_attempts: 5                # OTA_MAX_BOOT_ATTEMPTS
+  ota_max_version_fails: 3                # OTA_MAX_VERSION_FAILS
+
+  # IOT3-49 — dùng `batteryMappings[]` backend trả về làm nguồn chân lý cho tập pin.
+  # Đặt false CHỈ khi đang gỡ rối và muốn ép dùng bảng pin trong seed.
+  apply_battery_map: true
+
 mqtt:
-  enabled: false                          # Sprint IoT-2 Phase D — tạm tắt
+  # Bật để chạy đường MQTT-first (S4-FW-04). Không cần điền host/user/pass: `/provision` cấp
+  # đủ 6 trường lúc chạy. Các giá trị dưới chỉ dùng khi backend TẮT MQTT mà bạn vẫn muốn thử
+  # với broker cục bộ.
+  enabled: false
   host: localhost
   port: 21883                             # solar-mosquitto map 21883:1883
   tls: false
+  username: ""
+  password: ""
+
+  # GỐC topic. Tiền tố đầy đủ = "<gốc>/<mã thiết bị chữ thường>", khớp
+  # `MqttBrokerEndpointProvider.TopicPrefixFor()` của backend và ACL `solar/%u/...` của Mosquitto.
   topic_prefix: solar
-  qos: 1
+
+  # ⚠ QoS 0 là CỐ Ý: firmware dùng PubSubClient v2.8, thư viện KHÔNG hỗ trợ publish QoS 1
+  #   (xem audit `iot/iot-backend-contract-gaps.md` #4). Để 1 thì simulator "khoẻ hơn" thiết bị
+  #   thật và che mất lớp lỗi rơi message trên mạng chập chờn.
+  qos: 0
+
+  keepalive_s: 30                         # MQTT_KEEPALIVE_SEC
+  max_packet_size: 4096                   # MQTT_MAX_PACKET_SIZE
+  reconnect_interval_s: 5                 # MQTT_RECONNECT_INTERVAL_MS
+  auth_fail_threshold: 5                  # kAuthFailThreshold (IOT3-44)
+  publish_fail_threshold: 3               # MQTT_PUBLISH_FAIL_THRESHOLD (S4-FW-06)
+
+# Ghi state ra đĩa (provision, credential MQTT, bảng pin, trạng thái OTA).
+# false = mỗi lần chạy là một thiết bị mới tinh (provision lại từ đầu).
+persist_state: true
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────
+# DANH MỤC PIN DÙNG CHUNG — tra khi backend giao một serial không có trong devices[].batteries
+#
+# Vì sao CẦN: `POST /provision` trả `batteryMappings[]` gồm MỌI pin cùng site với thiết bị
+# (#IoT2-18: thiết bị chỉ được ingest cho pin CÙNG SITE). Với ESP32-SIM-001 ở Solar Farm Long An,
+# backend giao cả pin NMC 48V và LiFePO4 24V. Không khai loại pin ở đây thì simulator dựng mô
+# hình mặc định 12,8V cho chúng ⇒ backend chấm **Undervoltage Critical** liên tục vì ngưỡng NMC
+# là 42–54,6V. Cảnh báo giả, và rất khó truy nếu không biết chỗ này.
+#
+# Giá trị dưới lấy đúng từ `battery_assets` + `threshold_configs` của backend.
+battery_catalog:
+  - serial: BAT-2026-001        # LiFePO4 12V 100Ah · Long An · ngưỡng 10,5–14,6V
+    battery_asset_id: 54754d04-3c44-4a49-acf2-068cfde936bc
+    unit_id: 1
+    nominal_voltage: 12.8
+    nominal_capacity_ah: 100
+    initial_soc: 60.0
+    initial_soh: 94.2
+    cycle_count: 120
+    chemistry: LiFePO4
+  - serial: BAT-2026-002        # LiFePO4 12V 100Ah · Long An
+    battery_asset_id: 2810f7d9-a11e-4ab0-85d0-d4e68cce8443
+    unit_id: 2
+    nominal_voltage: 12.8
+    nominal_capacity_ah: 100
+    initial_soc: 55.0
+    initial_soh: 88.0
+    cycle_count: 245
+    chemistry: LiFePO4
+  - serial: BAT-2026-003        # NMC 48V 200Ah · Long An · ngưỡng 42–54,6V
+    battery_asset_id: 5e2116ec-4d54-4bc6-a2e8-543a86c48934
+    unit_id: 3
+    nominal_voltage: 48.0
+    nominal_capacity_ah: 200
+    initial_soc: 55.0
+    initial_soh: 82.0
+    cycle_count: 1850
+    chemistry: NMC
+  - serial: BAT-2026-004        # NMC 48V 200Ah · Long An
+    battery_asset_id: 8794a454-751a-4129-8cf9-d999ff359625
+    unit_id: 4
+    nominal_voltage: 48.0
+    nominal_capacity_ah: 200
+    initial_soc: 65.0
+    initial_soh: 90.0
+    cycle_count: 200
+    chemistry: NMC
+  - serial: BAT-2026-005        # LiFePO4 12V 100Ah · Đà Nẵng
+    battery_asset_id: faef67fb-be3a-42e6-8ed6-9eb11ada6ad8
+    unit_id: 5
+    nominal_voltage: 12.8
+    nominal_capacity_ah: 100
+    initial_soc: 40.0
+    initial_soh: 95.0
+    cycle_count: 80
+    chemistry: LiFePO4
+  - serial: BAT-2026-006        # NMC 48V 200Ah · không thuộc site nào
+    battery_asset_id: 5dd3738e-a122-412c-96fc-f9bd190ab728
+    unit_id: 6
+    nominal_voltage: 48.0
+    nominal_capacity_ah: 200
+    initial_soc: 55.0
+    initial_soh: 85.0
+    cycle_count: 300
+    chemistry: NMC
+  - serial: BAT-2026-007        # NCA 24V 150Ah · Đà Nẵng · ngưỡng 21–29,2V
+    battery_asset_id: 6f9ee6a1-dd0d-45fb-8831-df7be623aac8
+    unit_id: 7
+    nominal_voltage: 24.0
+    nominal_capacity_ah: 150
+    initial_soc: 50.0
+    initial_soh: 88.0
+    cycle_count: 150
+    chemistry: NCA
+  - serial: BAT-2026-008        # LiFePO4 12V 100Ah · không thuộc site nào
+    battery_asset_id: 125840ea-278b-49b5-8519-05a563865439
+    unit_id: 8
+    nominal_voltage: 12.8
+    nominal_capacity_ah: 100
+    initial_soc: 45.0
+    initial_soh: 92.0
+    cycle_count: 60
+    chemistry: LiFePO4
+  - serial: BAT-2026-009        # LiFePO4 12V 100Ah · không thuộc site nào
+    battery_asset_id: ab80f61e-1384-493a-98d5-fd9b445fa907
+    unit_id: 9
+    nominal_voltage: 12.8
+    nominal_capacity_ah: 100
+    initial_soc: 35.0
+    initial_soh: 90.0
+    cycle_count: 90
+    chemistry: LiFePO4
+  - serial: BAT-2026-REAL-001   # LiFePO4 24V 30Ah · Long An · ngưỡng 20–29,5V
+    # ⚠ Đây là loại pin DUY NHẤT trong DB có CurrentMaxCharge/Discharge (30A / 100A),
+    #   nên là pin duy nhất demo được RapidDischarge + AbnormalCharging (xem dataset anomaly).
+    battery_asset_id: ""
+    unit_id: 10
+    nominal_voltage: 24.0
+    nominal_capacity_ah: 30
+    initial_soc: 60.0
+    initial_soh: 90.0
+    cycle_count: 40
+    chemistry: LiFePO4
 
 devices:
-  # ─── Device 1: 2 pin LiFePO4 12V — scenario normal ───
+  # ─── Thiết bị 1: 2 pin LiFePO4 12V, đủ cảm biến — scenario normal ───
   - device_code: ESP32-SIM-001
     site_id_guid: b6d83be5-050c-47a0-9f73-3160f517be80
     site_label: solar-farm-long-an
@@ -36,8 +193,6 @@ devices:
     model: ESP32-WROOM-S3
     api_key: iotk_p-MbplnKWR1VjEVRgbsFMIeTWZsnhx5e86PNNiEkstU
     batteries:
-      # Sprint 1 spec (tasksprint S1-FW-04): "voltage 12.0–13.0V, dao động sine".
-      # SOC 25-30% giữ OCV(SOC) trong dải 12.0-13.0V trên LiFePO4 OCV curve.
       - serial: BAT-2026-001
         battery_asset_id: 54754d04-3c44-4a49-acf2-068cfde936bc
         unit_id: 1
@@ -57,17 +212,26 @@ devices:
         cycle_count: 245
         chemistry: LiFePO4
     sensors:
-      ina226: true
-      ds18b20: true
-      sht31: true
-      mq2: true
-      water_leak: true
+      ina226: true          # sourceType=IotGateway, sensorSourceCode="redundant"
+      ds18b20: true         # sourceType=IotGateway, sensorSourceCode="external-temp"
+      sht31: true           # → POST /api/ambient/readings/batch (mỗi 60s)
+      mq2: true             # → POST /api/environmental-incidents, type=GasLeak(3)
+      water_leak: true      # → POST /api/environmental-incidents, type=Flood(4)
     scenario: normal
     sensor_drift:
       voltage_v: 0.05
       temperature_c: 1.2
+    # Tham số cảm biến — mặc định đã khớp `include/config.h`, chỉ khai báo khi muốn demo nhanh.
+    sensor_tuning:
+      sht31_poll_interval_s: 60           # SHT31_POLL_INTERVAL_MS
+      mq2_threshold_raw: 2000             # MQ2_THRESHOLD_RAW
+      mq2_warmup_s: 30                    # MQ2_WARMUP_MS
+      mq2_poll_interval_s: 1              # MQ2_POLL_INTERVAL_MS
+      mq2_rearm_cooldown_s: 300           # MQ2_REARM_COOLDOWN_MS — 5' giữa 2 lần báo
+      water_leak_poll_interval_s: 0.5     # WATER_LEAK_POLL_INTERVAL_MS
+      water_leak_rearm_cooldown_s: 300    # WATER_LEAK_REARM_COOLDOWN_MS
 
-  # ─── Device 2: 1 pin NMC 48V 200Ah — scenario low_soc (demo P2 alert) ───
+  # ─── Thiết bị 2: 1 pin NMC 48V 200Ah — scenario low_soc (demo cảnh báo P2) ───
   - device_code: ESP32-SIM-002
     site_id_guid: b6d83be5-050c-47a0-9f73-3160f517be80
     site_label: solar-farm-long-an
@@ -96,18 +260,25 @@ devices:
       voltage_v: 0.08
       temperature_c: 0.8
 
-  # ─── Device 3 (GLOBAL KEY): phủ Site B + site-less + NCA + BAT-004 để test đủ scope ───
-  # Dùng legacy global key `dev-battery-ingest-key` (ApiKeys:SensorIngest) → KHÔNG bị device/site-check
-  # nên 1 "device" ingest được mọi pin (kể cả cross-site & site-less). Chỉ dùng cho TEST.
+  # ─── Thiết bị 3: khoá GLOBAL, phủ Site B + pin không thuộc site nào ───
+  #
+  # ⚠ CHỈ DÙNG ĐƯỢC VỚI `contract_version: current`.
+  #   `dev-battery-ingest-key` là khoá ingest dùng chung (ApiKeys:SensorIngest), KHÔNG gắn với một
+  #   IotDevice nào, nên `POST /api/iot-devices/provision` sẽ thất bại. Ở contract production,
+  #   firmware CHẶN ingest cho tới khi provision xong (`s_provisionDone`), nên thiết bị này sẽ chỉ
+  #   thử provision lại mỗi 30s và ghi log lỗi — đúng hành vi thiết bị thật chưa được đăng ký.
+  #   Muốn dùng ở production: tạo IotDevice thật cho mã này (scripts/provision_devices.py) rồi
+  #   thay `api_key` bằng `rawApiKey` nhận được.
+  #   Hoặc bỏ qua nó khi chạy:  python -m src.main --device ESP32-SIM-001 --device ESP32-SIM-002
   - device_code: ESP32-SIM-003
-    site_id_guid: 0bbfff66-2697-4205-bddc-5593b457d7bc   # Site B (metadata; global key không dùng để auth)
+    site_id_guid: 0bbfff66-2697-4205-bddc-5593b457d7bc
     site_label: solar-farm-da-nang
     firmware_version: 1.0.0-sim
     hardware_revision: ESP32-S3-DevKitC-1-N16R8
     model: ESP32-WROOM-S3
     api_key: dev-battery-ingest-key
     batteries:
-      - serial: BAT-2026-004           # Site A (Long An) · NMC
+      - serial: BAT-2026-004           # Site A · NMC
         battery_asset_id: 8794a454-751a-4129-8cf9-d999ff359625
         unit_id: 1
         nominal_voltage: 48.0
@@ -116,7 +287,7 @@ devices:
         initial_soh: 90.0
         cycle_count: 200
         chemistry: NMC
-      - serial: BAT-2026-005           # Site B (Da Nang) · LiFePO4
+      - serial: BAT-2026-005           # Site B · LiFePO4
         battery_asset_id: faef67fb-be3a-42e6-8ed6-9eb11ada6ad8
         unit_id: 2
         nominal_voltage: 12.8
@@ -125,7 +296,7 @@ devices:
         initial_soh: 95.0
         cycle_count: 80
         chemistry: LiFePO4
-      - serial: BAT-2026-006           # KHÔNG thuộc site nào (test site:none) · NMC
+      - serial: BAT-2026-006           # không thuộc site nào · NMC
         battery_asset_id: 5dd3738e-a122-412c-96fc-f9bd190ab728
         unit_id: 3
         nominal_voltage: 48.0
@@ -134,7 +305,7 @@ devices:
         initial_soh: 85.0
         cycle_count: 300
         chemistry: NMC
-      - serial: BAT-2026-007           # Site B (Da Nang) · NCA (test type:NCA)
+      - serial: BAT-2026-007           # Site B · NCA
         battery_asset_id: 6f9ee6a1-dd0d-45fb-8831-df7be623aac8
         unit_id: 4
         nominal_voltage: 24.0
@@ -143,7 +314,7 @@ devices:
         initial_soh: 88.0
         cycle_count: 150
         chemistry: NCA
-      - serial: BAT-2026-008           # customer.demo (e2e46e9c) · site-less → test Customer scope
+      - serial: BAT-2026-008           # customer.demo · không thuộc site
         battery_asset_id: 125840ea-278b-49b5-8519-05a563865439
         unit_id: 5
         nominal_voltage: 12.8
@@ -152,7 +323,7 @@ devices:
         initial_soh: 92.0
         cycle_count: 60
         chemistry: LiFePO4
-      - serial: BAT-2026-009           # customer.demo (e2e46e9c) · site-less → test Customer scope
+      - serial: BAT-2026-009           # customer.demo · không thuộc site
         battery_asset_id: ab80f61e-1384-493a-98d5-fd9b445fa907
         unit_id: 6
         nominal_voltage: 12.8
@@ -172,7 +343,18 @@ devices:
       voltage_v: 0.05
       temperature_c: 1.0
 
-# ─── Scenario reference (đổi bằng `scenario:` trên device, hoặc CLI --scenario) ───
-# normal | overheat | overvoltage | undervoltage | low_soc | rapid_discharge | abnormal_charging
-# device_offline | soh_degradation | high_ambient_temp | high_humidity | high_temp_humidity_combo
-# sensor_mismatch | smoke | fire_detected | gas_leak | water_leak | bms_error | clock_skew
+# ─── Danh sách scenario (đặt ở `scenario:` của thiết bị, hoặc CLI --scenario, hoặc lệnh MQTT
+#     `set_scenario` lúc đang chạy) ───
+#
+#   Pin (BMS):        normal · overheat · overvoltage · undervoltage · low_soc · rapid_discharge
+#                     abnormal_charging · soh_degradation · bms_error
+#   Cross-source:     sensor_mismatch          (INA226 lệch >0.5V, DS18B20 lệch >5°C)
+#   Môi trường:       high_ambient_temp · high_humidity · high_temp_humidity_combo
+#   Sự cố an toàn:    gas_leak · smoke         → EnvironmentalIncident type=GasLeak(3)
+#                     water_leak               → type=Flood(4)
+#                     fire_detected            → type=FireDetected(2)  ⚠ mở rộng RIÊNG của
+#                                                simulator, firmware KHÔNG có đường báo cháy
+#   Vận hành:         device_offline (dừng sau 60s để demo LWT) · clock_skew (+10 phút, #IoT2-15)
+#
+# ⚠ `smoke` và `gas_leak` đều cho ra `GasLeak (3)`: MQ-2 bản chất là cảm biến GAS, và firmware
+#   ánh xạ nó thành GasLeak (quyết định NS-24 #664). `Smoke (1)` dành cho cảm biến khói quang học.
