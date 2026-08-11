@@ -1,7 +1,10 @@
-# Seed data cho IoT Simulator — sinh từ thực tế DB backend lúc 2026-06-13
-#   Site:      Solar Farm Long An (b6d83be5-050c-47a0-9f73-3160f517be80)
-#   3 pin:     BAT-2026-001 / 002 / 003 (đã có sẵn trong DB)
-#   2 device:  ESP32-SIM-001 + ESP32-SIM-002 (vừa provision qua /api/admin/iot-devices)
+# Seed data cho IoT Simulator — phủ ĐỦ scope test (cập nhật 2026-06-27)
+#   Site A: Solar Farm Long An  (b6d83be5-050c-47a0-9f73-3160f517be80) → BAT-001/002/003/004
+#   Site B: Solar Farm Da Nang  (0bbfff66-2697-4205-bddc-5593b457d7bc) → BAT-005/007
+#   Site-less (SiteId=null): BAT-006 (cust c673c925) · BAT-008/009 (cust.demo e2e46e9c → test Customer login)
+#   Types: LiFePO4(cb3c6312) · NMC(96856d6b) · NCA(1970a0c1)
+#   3 device: ESP32-SIM-001/002 (per-device key, Site A) + ESP32-SIM-003 (GLOBAL key → mọi pin)
+#   → test được: asset · assets · customer · site · sites · type · all · site:none
 
 backend:
   base_url: http://localhost:4001         # ApiGateway (HTTP, không phải HTTPS)
@@ -92,6 +95,82 @@ devices:
     sensor_drift:
       voltage_v: 0.08
       temperature_c: 0.8
+
+  # ─── Device 3 (GLOBAL KEY): phủ Site B + site-less + NCA + BAT-004 để test đủ scope ───
+  # Dùng legacy global key `dev-battery-ingest-key` (ApiKeys:SensorIngest) → KHÔNG bị device/site-check
+  # nên 1 "device" ingest được mọi pin (kể cả cross-site & site-less). Chỉ dùng cho TEST.
+  - device_code: ESP32-SIM-003
+    site_id_guid: 0bbfff66-2697-4205-bddc-5593b457d7bc   # Site B (metadata; global key không dùng để auth)
+    site_label: solar-farm-da-nang
+    firmware_version: 1.0.0-sim
+    hardware_revision: ESP32-S3-DevKitC-1-N16R8
+    model: ESP32-WROOM-S3
+    api_key: dev-battery-ingest-key
+    batteries:
+      - serial: BAT-2026-004           # Site A (Long An) · NMC
+        battery_asset_id: 8794a454-751a-4129-8cf9-d999ff359625
+        unit_id: 1
+        nominal_voltage: 48.0
+        nominal_capacity_ah: 200
+        initial_soc: 65.0
+        initial_soh: 90.0
+        cycle_count: 200
+        chemistry: NMC
+      - serial: BAT-2026-005           # Site B (Da Nang) · LiFePO4
+        battery_asset_id: faef67fb-be3a-42e6-8ed6-9eb11ada6ad8
+        unit_id: 2
+        nominal_voltage: 12.8
+        nominal_capacity_ah: 100
+        initial_soc: 40.0
+        initial_soh: 95.0
+        cycle_count: 80
+        chemistry: LiFePO4
+      - serial: BAT-2026-006           # KHÔNG thuộc site nào (test site:none) · NMC
+        battery_asset_id: 5dd3738e-a122-412c-96fc-f9bd190ab728
+        unit_id: 3
+        nominal_voltage: 48.0
+        nominal_capacity_ah: 200
+        initial_soc: 55.0
+        initial_soh: 85.0
+        cycle_count: 300
+        chemistry: NMC
+      - serial: BAT-2026-007           # Site B (Da Nang) · NCA (test type:NCA)
+        battery_asset_id: 6f9ee6a1-dd0d-45fb-8831-df7be623aac8
+        unit_id: 4
+        nominal_voltage: 24.0
+        nominal_capacity_ah: 150
+        initial_soc: 50.0
+        initial_soh: 88.0
+        cycle_count: 150
+        chemistry: NCA
+      - serial: BAT-2026-008           # customer.demo (e2e46e9c) · site-less → test Customer scope
+        battery_asset_id: 125840ea-278b-49b5-8519-05a563865439
+        unit_id: 5
+        nominal_voltage: 12.8
+        nominal_capacity_ah: 100
+        initial_soc: 45.0
+        initial_soh: 92.0
+        cycle_count: 60
+        chemistry: LiFePO4
+      - serial: BAT-2026-009           # customer.demo (e2e46e9c) · site-less → test Customer scope
+        battery_asset_id: ab80f61e-1384-493a-98d5-fd9b445fa907
+        unit_id: 6
+        nominal_voltage: 12.8
+        nominal_capacity_ah: 100
+        initial_soc: 35.0
+        initial_soh: 90.0
+        cycle_count: 90
+        chemistry: LiFePO4
+    sensors:
+      ina226: false
+      ds18b20: false
+      sht31: false
+      mq2: false
+      water_leak: false
+    scenario: normal
+    sensor_drift:
+      voltage_v: 0.05
+      temperature_c: 1.0
 
 # ─── Scenario reference (đổi bằng `scenario:` trên device, hoặc CLI --scenario) ───
 # normal | overheat | overvoltage | undervoltage | low_soc | rapid_discharge | abnormal_charging

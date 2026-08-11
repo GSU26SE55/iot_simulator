@@ -2,7 +2,9 @@
 
 > Hướng dẫn step-by-step để cài đặt, cấu hình và chạy được `iot-simulator` trong dự án **Solar Battery Maintenance Management System (GSU26SE55)**.
 > Đối tượng: thành viên team BE / FE / AI / QA cần demo end-to-end pipeline IoT khi chưa có hardware ESP32 thật.
-> Cập nhật: 2026-06-13 — đã verify pipeline simulator → ApiGateway → BatteryService → TimescaleDB hoạt động.
+> Cập nhật: **2026-06-26** — simulator nâng full parity với firmware ESP32 "complete" (commit `ec68591`). Verify end-to-end LIVE cả 2 contract (`current` + `iot2-production`): provision → ingest multi-source → heartbeat → ambient → firmware-check/OTA → environmental incident. 44/44 unit test PASS.
+>
+> ⚠ **Hai fix backend bắt buộc cho `iot2-production`** (xem [§2.5](#25-bắt-buộc-cho-iot2-production--2-fix-backend--scope-environmentalingest)): nếu backend chạy bản chưa có 2 fix này thì iot2 ingest + ambient/incident sẽ **500**.
 
 ---
 
@@ -114,6 +116,31 @@ Password: Admin123@
 | Password | `Password12345@` |
 | DB BatteryService | `battery_db` |
 
+### 2.5. (Bắt buộc cho `iot2-production`) — 2 fix backend + scope EnvironmentalIngest
+
+> Mode `current` (legacy) chạy được ngay, KHÔNG cần phần này. Chỉ đọc khi dùng `contract_version: iot2-production`.
+
+**(a) 2 fix backend** — phát hiện 2026-06-26 khi verify simulator. Nếu backend của bạn build từ branch chưa có 2 fix này → iot2 ingest + ambient/incident trả **500** (firmware ESP32 thật cũng dính y hệt):
+
+| Bug | Triệu chứng | Fix (file backend) |
+|---|---|---|
+| `SensorIngestIdempotencyRecord.Id` không sinh (PK `ValueGeneratedNever`) | `POST /api/sensor-readings/batch` có `Idempotency-Key` → request thứ 2 trở đi **500** `duplicate key PK_sensor_ingest_idempotency_records` | `BatchIngestSensorReadingsCommandHandler.cs` — thêm `Id = Guid.NewGuid()` |
+| Named policy `EnvironmentalIngest` chưa đăng ký | ambient + environmental-incidents → **500** `AuthorizationPolicy 'EnvironmentalIngest' was not found` | `AmbientReadingsController.cs` + `EnvironmentalIncidentsController.cs` — đổi sang `[IotApiKeyScopeRequirement(IotApiKeyScopeEnum.EnvironmentalIngest)]` |
+
+Sau khi fix, rebuild service: `cd backend && docker compose up -d --build batteryservice`.
+
+**(b) Scope `EnvironmentalIngest` cho device** — `EdgeDeviceDefault = 11` (SensorIngest 1 + DeviceHeartbeat 2 + FirmwareCheck 8) **KHÔNG** gồm `EnvironmentalIngest = 4`. Device chỉ gửi BMS ingest + heartbeat + firmware-check là đủ scope. Nhưng nếu device bật `sht31`/`mq2`/`water_leak` (ambient + environmental incident) thì API key PHẢI có thêm scope `EnvironmentalIngest`, nếu không → **401** (đúng, không phải 500).
+
+Cấp scope khi tạo device (đặt `apiKeyScopes = 15` = 11 | 4):
+```bash
+# trong body POST /api/admin/iot-devices (Bước 4.4): thêm "apiKeyScopes": 15
+```
+Hoặc grant cho device đã tồn tại bằng SQL (dev only):
+```bash
+PGPASSWORD='Password12345@' psql -h localhost -p 5433 -U postgres -d battery_db \
+  -c "update iot_devices set api_key_scopes = api_key_scopes | 4 where device_code='ESP32-SIM-001';"
+```
+
 ---
 
 ## 3. Setup môi trường — 5 bước
@@ -162,7 +189,7 @@ IOT_TLS_VERIFY=false
 make test
 ```
 
-Phải thấy `Ran 26 tests in ~0.003s — OK`. Nếu fail → simulator code có vấn đề, đừng tiếp tục.
+Phải thấy `Ran 44 tests in ~0.003s — OK` (3 file: `test_bms.py`, `test_payload.py`, `test_features.py`). Nếu fail → simulator code có vấn đề, đừng tiếp tục.
 
 ### Bước 3.5 — Kiểm tra backend alive
 
@@ -236,7 +263,7 @@ Validation backend:
 - `siteId`: Guid không rỗng
 - `hardwareRevision`: ≤64 chars, optional
 - `heartbeatIntervalSeconds`: 10–3600, default 60
-- `apiKeyScopes`: default `EdgeDeviceDefault` = 11 (sensor.ingest + device.heartbeat + environmental.ingest)
+- `apiKeyScopes`: default `EdgeDeviceDefault` = **11** = sensor.ingest(1) + device.heartbeat(2) + firmware.check(8). ⚠ KHÔNG gồm `environmental.ingest`(4). Device dùng ambient/incident phải set `apiKeyScopes: 15` (xem [§2.5b](#25-bắt-buộc-cho-iot2-production--2-fix-backend--scope-environmentalingest)).
 - `notes`: ≤1000 chars, optional
 
 ```bash
@@ -596,7 +623,19 @@ PGPASSWORD='Password12345@' psql -h localhost -p 5433 -U postgres -d battery_db 
 
 ### B5 — Calibration (Sprint S7 — chưa implement đầy đủ)
 
-### B6 — OTA firmware (Sprint S7)
+### B6 — OTA firmware (Sprint 7 — đã mô phỏng, chỉ `iot2-production`)
+
+Simulator poll `GET /api/iot-devices/firmware-check` mỗi 1h (và ngay tick đầu). Nếu backend có firmware release mới (target version ≠ current) → simulator chạy lifecycle `PUT /api/iot-devices/firmware-update-log/{id}`: `Downloading → Installing → Success` rồi **bump `firmware_version`** in-memory (heartbeat/firmware-check kế tiếp dùng version mới → backend hết offer). Không tải `.bin`/verify SHA/rollback partition (cần hardware thật).
+
+```bash
+# Trigger ngay 1 chu kỳ check (không cần đợi 1h) — qua MQTT command trigger_ota:
+#   publish solar/ESP32-SIM-001/cmd  payload {"cmdId":"x","type":"trigger_ota"}
+# Hoặc xem firmware-check chạy lúc boot:
+IOT_CONTRACT_VERSION=iot2-production .venv/bin/python -m src.main --no-dashboard --device ESP32-SIM-001 2>&1 | grep -iE "ota|firmware"
+# Để thấy update thật: admin tạo IotFirmwareRelease mới + gán target cho device, rồi chạy lại.
+```
+
+> Cột `OTA` trên dashboard (`updates/checks`) + `FW` (version hiện tại) phản ánh trạng thái OTA.
 
 ### B7 — Resilience mất mạng
 
@@ -640,10 +679,13 @@ Các nguyên nhân thường gặp:
 
 | Status code | Nguyên nhân | Fix |
 |---|---|---|
-| `401` | API key sai/thiếu scope | Rotate key (Bước 4.5), check `apiKeyScopes` ≥ 11 |
+| `401` (ingest/heartbeat) | API key sai, hoặc thiếu scope tương ứng (`SensorIngest`/`DeviceHeartbeat`/`FirmwareCheck`) | Rotate key (Bước 4.5), check `apiKeyScopes` |
+| `401` (ambient/incident) | Device key thiếu scope `EnvironmentalIngest` (EdgeDeviceDefault=11 không có) | Grant scope 4 → `apiKeyScopes=15` ([§2.5b](#25-bắt-buộc-cho-iot2-production--2-fix-backend--scope-environmentalingest)) |
 | `400` field error | Validation fail | Đọc `listErrors` chi tiết — thường do field thiếu / sai range |
-| `404` | Endpoint không tồn tại | Sai `IOT_BASE_URL` (phải là `http://localhost:4001` không `https://...:7200`) |
-| `500` PK conflict | Gửi nhiều reading cùng `(time, batteryAssetId)` — chỉ xảy ra contract iot2 trên backend chưa migrate | Dùng `contract_version: current`, hoặc đợi Sprint IoT-2 #IoT2-14 merge |
+| `404` | Endpoint không tồn tại | Sai `IOT_BASE_URL` (phải là `http://localhost:4001`, không `https://...:7200`) |
+| `500` `duplicate key PK_sensor_ingest_idempotency_records` | **Bug backend** — `SensorIngestIdempotencyRecord.Id` không sinh | Áp dụng fix backend ([§2.5a](#25-bắt-buộc-cho-iot2-production--2-fix-backend--scope-environmentalingest)) rồi rebuild `batteryservice` |
+| `500` `AuthorizationPolicy 'EnvironmentalIngest' was not found` | **Bug backend** — named policy chưa đăng ký (ambient/incident) | Áp dụng fix backend ([§2.5a](#25-bắt-buộc-cho-iot2-production--2-fix-backend--scope-environmentalingest)) rồi rebuild |
+| `500` `instance ... already being tracked {Time, BatteryAssetId}` | Gửi ≥2 reading cùng `(time, batteryAssetId)` trong 1 batch (multi-source) | Đã xử lý: simulator stagger `time` theo ms. Nếu vẫn gặp → kiểm tra mã staggering trong `device._tick_ingest` |
 
 ### 10.3. `make install` fail trên Python 3.13/3.14
 
@@ -688,45 +730,51 @@ JWT chỉ sống 1 giờ. Login lại Bước 4.1.
 ```
 boot
   ├── (iot2-production) POST /api/iot-devices/provision  ← 1 lần
+  │     → áp dụng response: pollingIntervalSeconds, heartbeatIntervalSeconds,
+  │       siteId (override seed → dùng cho ambient/incident), ntpServer
   └── loop:
-       ├── mỗi `ingest_interval_s` (15s):
-       │     read BMS từng pin (multi-drop simulate)
-       │     [iot2-only] read INA226 + DS18B20 (sensor phụ)
-       │     pin timestamp 1 lần cho toàn bộ batch (cross-source pair §1.6.6)
-       │     build payload (current vs iot2 contract)
-       │     POST /api/sensor-readings/batch
+       ├── mỗi `ingest_interval_s` (mặc định 5s; provision có thể đổi):
+       │     read BMS từng pin
+       │     [iot2-only] read INA226 (redundant) + DS18B20 (external-temp)
+       │     gom theo pin; [iot2] stagger `time` +1ms/+2ms mỗi source (tránh PK trùng)
+       │     build payload {"items":[...]} (current vs iot2 shape)
+       │     [MQTT bật + iot2] publish per-pin solar/{dev}/{serial}/telemetry (streak fail≥3 → fallback HTTPS)
+       │     POST /api/sensor-readings/batch  (HTTPS, kèm Idempotency-Key nếu iot2)
        │       ├── 2xx → sent++, flush queue cũ
        │       └── lỗi → enqueue + exponential backoff
        │
        ├── mỗi `heartbeat_interval_s` (60s) [iot2-only]:
-       │     POST /api/iot-devices/heartbeat
+       │     POST /api/iot-devices/heartbeat   (HTTP-only, khớp firmware)
        │
-       ├── mỗi 5 phút (SHT31 enabled):
-       │     POST /api/ambient/readings/batch
+       ├── mỗi 5 phút (SHT31 enabled, iot2):
+       │     POST /api/ambient/readings/batch  (cần scope EnvironmentalIngest)
        │
-       ├── mỗi 6 giờ [iot2-only]:
+       ├── mỗi 1 giờ [iot2-only] — OTA (Sprint 7):
        │     GET /api/iot-devices/firmware-check
+       │       → nếu có bản mới: PUT firmware-update-log {Downloading→Installing→Success}
+       │         + bump firmware_version (mô phỏng flash; không tải .bin/SHA thật)
        │
-       └── scenario triggers:
-             smoke/fire/gas/water_leak → POST /api/environmental-incidents
+       └── scenario triggers [iot2-only]:
+             smoke/fire/gas/water_leak → POST /api/environmental-incidents (cần scope EnvironmentalIngest)
              device_offline → halt sau 60s
              clock_skew → deviceTimestamp lệch +10 phút
 ```
 
 ### 11.2. So sánh 2 contract version
 
-| Aspect | `current` (TODAY) | `iot2-production` (Sprint IoT-2 #IoT2-14) |
+| Aspect | `current` (Sprint 1 legacy) | `iot2-production` (Sprint 3 production — KHỚP firmware `buildProductionBatchPayload`) |
 |---|---|---|
 | Endpoint sensor batch | `POST /api/sensor-readings/batch` | cùng URL |
-| Body wrapper | `{ "items": [...] }` | `{ "DeviceTimestamp": "...", "Readings": [...] }` |
-| Reading shape | `batteryAssetId` Guid + `sourceDeviceId` | `BatteryAssetSerial` + `SourceType` + `SensorSourceCode` + `BmsErrorCode` |
+| Body wrapper | `{ "items": [...] }` | `{ "items": [...] }` — **cùng envelope** (backend chỉ bind `List<SensorReadingItem> Items`; KHÔNG có wrapper `DeviceTimestamp`/`Readings`) |
+| Reading shape | `batteryAssetId` Guid + time + V/I/T/SOC/cycle | `batteryAssetSerial` + `time` + **`deviceTimestamp` per-item** + V/I/T/SOC/cycle + `sourceType` + `sensorSourceCode` + (optional) `sohPercent`/`chargingState`/`bmsErrorCode`. **camelCase** (không phải PascalCase). |
 | Header | `X-Api-Key` only | thêm `X-Device-Code` + `Idempotency-Key` (UUIDv4) |
-| Multi-source/tick (BMS+INA226+DS18B20) | KHÔNG (PK collision) | CÓ (`SourceType` vào composite PK) |
-| Provision/heartbeat endpoint | chưa có | `/api/iot-devices/{provision,heartbeat,firmware-check}` |
+| Multi-source/tick (BMS+INA226+DS18B20) | KHÔNG (chỉ 1 BMS reading/pin) | CÓ. Backend PK hypertable vẫn `(Time, BatteryAssetId)` → simulator **stagger `time` theo ms** mỗi source trong 1 pin để khỏi trùng PK (backend khuyến nghị ms-resolution; `CrossSourceValidationService` ghép cặp theo cửa sổ 60s nên lệch ms vẫn pair đúng). `deviceTimestamp` giữ 1 mốc/tick. |
+| Provision/heartbeat/OTA | KHÔNG gọi | `/api/iot-devices/{provision,heartbeat,firmware-check,firmware-update-log}`; provision response **được áp dụng** (polling/heartbeat interval + **siteId override seed**) |
+| MQTT (nếu bật) | KHÔNG | telemetry **per-pin** `solar/{dev}/{serial}/telemetry`; command `{cmdId,type,params}` → ack `{cmdId,status,error?}` |
 | Cross-source SensorMismatch | chưa demo được | demo được |
-| Clock skew reject | chưa enforce | reject ở Sprint #IoT2-15 |
+| Clock skew reject | chưa enforce | reject ở `#IoT2-15` |
 
-**Khi nào switch sang iot2:** Sprint IoT-2 Phase B–C merge vào `dev` → Thắng thông báo → đổi `seed.yaml: contract_version: iot2-production` → test lại.
+**Khi nào dùng iot2:** mặc định seed là `current` (an toàn, chạy ngay). Đổi sang `iot2-production` để demo đầy đủ Sprint 2–7 (provision/heartbeat/MQTT/ambient/incident/OTA) — **cần backend có 2 fix + scope** ở [§2.5](#25-bắt-buộc-cho-iot2-production--2-fix-backend--scope-environmentalingest). Đổi bằng `seed.yaml: contract_version: iot2-production` hoặc `IOT_CONTRACT_VERSION=iot2-production`.
 
 ### 11.3. Local queue resilience
 
@@ -772,15 +820,25 @@ curl -s -X POST "http://localhost:4001/api/admin/iot-devices/$DEVICE_ID/rotate-k
 
 Cập nhật `seed.yaml: devices[].api_key`, restart simulator.
 
-### 12.2. Đổi scenario runtime — qua MQTT (chỉ khi enabled)
+### 12.2. Downlink command — qua MQTT (chỉ khi `mqtt.enabled` + iot2)
 
-Backend publish command:
+Schema **khớp firmware ESP32** (`cmd_logic.cpp`): `{ "cmdId", "type", "params" }` → ack `{ "cmdId", "status": "ok|failed|unknown", "error"? }` trên `solar/{dev}/cmd/ack`. `type` case-insensitive, chấp nhận cả `_` và `-`.
+
 ```
 Topic: solar/ESP32-SIM-001/cmd
-Payload: {"cmdId":"abc-123", "action":"set_scenario", "value":"overheat"}
-```
 
-Simulator nhận, đổi scenario, publish ack lên `solar/ESP32-SIM-001/cmd/ack`.
+# Đổi interval ingest (1..3600s):
+{"cmdId":"c1", "type":"set_interval", "params":{"pollingSeconds":30}}
+
+# Yêu cầu gửi heartbeat ngay:
+{"cmdId":"c2", "type":"request_heartbeat"}
+
+# Trigger 1 chu kỳ OTA check:
+{"cmdId":"c3", "type":"trigger_ota"}
+
+# (sim-only, firmware KHÔNG có) đổi scenario runtime để demo:
+{"cmdId":"c4", "type":"set_scenario", "params":{"scenario":"overheat"}}
+```
 
 ### 12.3. Reset queue
 

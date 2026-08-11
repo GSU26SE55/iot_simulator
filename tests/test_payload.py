@@ -100,16 +100,43 @@ class CurrentContractTest(unittest.TestCase):
 
 
 class Iot2ContractTest(unittest.TestCase):
-    """Contract `iot2-production` = Sprint IoT-2 #IoT2-14."""
+    """Contract `iot2-production` = Sprint 3 production (firmware buildProductionBatchPayload).
 
-    def test_wrapper_has_devicetimestamp_and_readings(self):
+    ⚠ KHỚP CHÍNH XÁC backend BatchIngestSensorReadingsCommand.Items (camelCase, KHÔNG có
+    wrapper DeviceTimestamp/Readings). Trước đây simulator gửi `{DeviceTimestamp, Readings[]}`
+    PascalCase → backend bind Items rỗng → 400. Đã sửa khớp firmware (audit #10 README).
+    """
+
+    def test_items_envelope_no_wrapper(self):
         dev = SimulatedDevice(_device_cfg(), _backend(CONTRACT_IOT2), _mqtt(),
                               Path("/tmp/iot-sim-test"))
         t = pinned_time_iso()
         bms = MockBattery(dev.cfg.batteries[0]).step(15, 0, "normal", t)
         payload = dev._build_ingest_payload(t, [dev._bms_to_dict(bms)])
-        self.assertIn("DeviceTimestamp", payload)
-        self.assertIn("Readings", payload)
+        self.assertIn("items", payload)              # backend bind List<SensorReadingItem> Items
+        self.assertNotIn("DeviceTimestamp", payload) # KHÔNG có wrapper
+        self.assertNotIn("Readings", payload)
+
+    def test_bms_item_camelcase_and_perfield(self):
+        dev = SimulatedDevice(_device_cfg(), _backend(CONTRACT_IOT2), _mqtt(),
+                              Path("/tmp/iot-sim-test"))
+        t = pinned_time_iso()
+        bms = MockBattery(dev.cfg.batteries[0]).step(15, 0, "normal", t)
+        d = dev._bms_to_dict(bms)
+        # camelCase fields khớp firmware buildProductionBatchPayload + SensorReadingItem.
+        for k in ("batteryAssetSerial", "time", "deviceTimestamp", "voltage", "current",
+                  "temperature", "socPercent", "cycleCount", "sourceType",
+                  "sensorSourceCode", "sohPercent", "chargingState"):
+            self.assertIn(k, d, f"thiếu field {k}")
+        # KHÔNG còn PascalCase (contract cũ sai)
+        for k in ("BatteryAssetSerial", "SourceType", "SensorSourceCode", "Voltage"):
+            self.assertNotIn(k, d)
+        self.assertEqual(d["sourceType"], 1)                 # Bms
+        self.assertEqual(d["sensorSourceCode"], "primary")
+        self.assertEqual(d["deviceTimestamp"], d["time"])    # #IoT2-15 clock skew
+        self.assertRegex(d["time"], ISO_Z)
+        # normal scenario → KHÔNG có bmsErrorCode (chỉ gửi khi có lỗi)
+        self.assertNotIn("bmsErrorCode", d)
 
     def test_multi_source_for_cross_validation(self):
         dev = SimulatedDevice(_device_cfg(), _backend(CONTRACT_IOT2), _mqtt(),
@@ -120,21 +147,33 @@ class Iot2ContractTest(unittest.TestCase):
         ina = make_ina226_reading(bms, dev.cfg.sensor_drift, "normal")
         ds = make_ds18b20_reading(bms, dev.cfg.sensor_drift, "normal")
         readings = [dev._bms_to_dict(bms), dev._gw_to_dict(ina), dev._gw_to_dict(ds)]
-        # phải có ít nhất SourceType=1 (Bms) + SourceType=2 (IotGateway)
-        source_types = {r["SourceType"] for r in readings}
+        source_types = {r["sourceType"] for r in readings}
         self.assertEqual(source_types, {1, 2})
-        # SensorSourceCode khớp MO §52.9
-        codes = {r["SensorSourceCode"] for r in readings}
+        codes = {r["sensorSourceCode"] for r in readings}
         self.assertEqual(codes, {"primary", "redundant", "external-temp"})
 
-    def test_bms_error_code_max_64_chars(self):
+    def test_gateway_numeric_not_null_and_no_optional(self):
+        """Backend Voltage/Current/Temperature là decimal non-nullable → gateway phải gửi
+        số (0.0 cho field không đo), KHÔNG null. Và gateway KHÔNG có soh/chargingState/error."""
+        dev = SimulatedDevice(_device_cfg(), _backend(CONTRACT_IOT2), _mqtt(),
+                              Path("/tmp/iot-sim-test"))
+        bms = MockBattery(dev.cfg.batteries[0]).step(15, 0, "normal", pinned_time_iso())
+        ds = dev._gw_to_dict(make_ds18b20_reading(bms, dev.cfg.sensor_drift, "normal"))
+        for k in ("voltage", "current", "temperature", "socPercent", "cycleCount"):
+            self.assertIsNotNone(ds[k])
+            self.assertIsInstance(ds[k], (int, float))
+        for k in ("sohPercent", "chargingState", "bmsErrorCode"):
+            self.assertNotIn(k, ds)
+
+    def test_bms_error_code_present_and_max_64(self):
         cfg = _device_cfg()
         dev = SimulatedDevice(cfg, _backend(CONTRACT_IOT2), _mqtt(),
                               Path("/tmp/iot-sim-test"))
         bms = MockBattery(cfg.batteries[0]).step(15, 0, "bms_error", pinned_time_iso())
         d = dev._bms_to_dict(bms)
-        self.assertIsNotNone(d["BmsErrorCode"])
-        self.assertLessEqual(len(d["BmsErrorCode"]), 64)
+        self.assertIn("bmsErrorCode", d)
+        self.assertIsNotNone(d["bmsErrorCode"])
+        self.assertLessEqual(len(d["bmsErrorCode"]), 64)
 
     def test_pinned_timestamp_across_sources(self):
         """Cross-source pair §1.6.6 cần BMS + IotGateway cùng phút.

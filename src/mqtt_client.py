@@ -1,11 +1,16 @@
 """MQTT client (Sprint 4 — NI §8.3, MO §52.14).
 
-Topic design (5 topic per device theo ACL §52.14):
-  solar/{siteId}/{deviceCode}/telemetry      publish (uplink reading)
-  solar/{deviceCode}/heartbeat               publish
-  solar/{deviceCode}/status                  publish (LWT "offline" retain)
-  solar/{deviceCode}/cmd                     subscribe (downlink command)
-  solar/{deviceCode}/cmd/ack                 publish ack sau khi exec
+Topic design — KHỚP 1:1 firmware ESP32 `mqtt_client.cpp` (`solar/{deviceCode}/...`):
+  solar/{deviceCode}/{batterySerial}/telemetry  publish (uplink reading, per-pin)
+  solar/{deviceCode}/heartbeat                   publish (firmware HTTP-only, giữ helper)
+  solar/{deviceCode}/status                      publish (LWT "offline" retain)
+  solar/{deviceCode}/cmd                         subscribe (downlink command)
+  solar/{deviceCode}/cmd/ack                     publish ack sau khi exec
+
+> Firmware publish telemetry MỖI PIN 1 message lên `solar/{dev}/{serial}/telemetry`
+> (mqtt_client.cpp::mqttPublishTelemetry). Trước đây simulator gom cả batch lên
+> `solar/{siteId}/{dev}/telemetry` (sai cả topic lẫn grouping) → broker ACL
+> `solar/%u/+/telemetry` reject. Đã sửa khớp firmware.
 
 Để giữ simulator nhẹ, MQTT là optional — bật bằng `mqtt.enabled: true` trong seed.yaml hoặc env IOT_MQTT_ENABLED=true.
 Khi tắt, simulator chỉ dùng HTTPS.
@@ -43,11 +48,15 @@ class MqttOptions:
 class IotMqttClient:
     """Wrapper paho-mqtt với LWT + publish helpers + downlink callback."""
 
-    def __init__(self, opts: MqttOptions, on_command: Callable[[dict], None] | None = None):
+    def __init__(self, opts: MqttOptions, on_command: Callable[[dict], None] | None = None,
+                 on_connect: Callable[[], None] | None = None):
         if not _HAS_PAHO:
             raise RuntimeError("paho-mqtt chưa cài. pip install paho-mqtt>=2.0.0")
         self.opts = opts
         self.on_command = on_command
+        # Gọi khi (re)connect thành công — device reset consecutive-fail streak (S4-FW-06,
+        # firmware mqttResetConsecutiveFails trong tryConnect success).
+        self.on_connect_cb = on_connect
         self._lock = threading.Lock()
         self._connected = False
         self._client = mqtt.Client(
@@ -70,12 +79,13 @@ class IotMqttClient:
         self._client.on_disconnect = self._on_disconnect
         self._client.on_message = self._on_message
 
-    # topic helpers
+    # topic helpers — khớp firmware mqtt_client.cpp (snprintf "%s/%s/...").
     def _t(self, kind: str) -> str:
-        p = self.opts.topic_prefix
-        if kind == "telemetry":
-            return f"{p}/{self.opts.site_id}/{self.opts.device_code}/telemetry"
-        return f"{p}/{self.opts.device_code}/{kind}"
+        return f"{self.opts.topic_prefix}/{self.opts.device_code}/{kind}"
+
+    def _telemetry_topic(self, battery_serial: str) -> str:
+        # firmware: solar/{deviceCode}/{batterySerial}/telemetry (mqttPublishTelemetry).
+        return f"{self.opts.topic_prefix}/{self.opts.device_code}/{battery_serial}/telemetry"
 
     def connect(self) -> bool:
         try:
@@ -95,8 +105,12 @@ class IotMqttClient:
         except OSError:
             pass
 
-    def publish_telemetry(self, payload: dict) -> bool:
-        return self._publish(self._t("telemetry"), payload)
+    def publish_telemetry(self, battery_serial: str, payload: dict) -> bool:
+        # Defensive: serial rỗng → topic invalid `solar/dev//telemetry` (firmware cũng guard).
+        if not battery_serial:
+            log.warning("[mqtt] publish_telemetry FAIL — batterySerial rỗng")
+            return False
+        return self._publish(self._telemetry_topic(battery_serial), payload)
 
     def publish_heartbeat(self, payload: dict) -> bool:
         return self._publish(self._t("heartbeat"), payload)
@@ -129,6 +143,8 @@ class IotMqttClient:
             self._client.publish(self._t("status"), payload="online", qos=1, retain=True)
             # subscribe downlink command
             self._client.subscribe(self._t("cmd"), qos=1)
+            if self.on_connect_cb:
+                self.on_connect_cb()
         else:
             log.warning("[mqtt] connect failed rc=%s", rc)
 

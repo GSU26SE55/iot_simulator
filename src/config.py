@@ -11,13 +11,18 @@ import yaml
 # ─────────────────────────────────────────────────────────────────────────────
 # Contract version
 # ─────────────────────────────────────────────────────────────────────────────
-# `current`        — contract đã merge trong backend HÔM NAY (api-battery.md `POST /api/sensor-readings/batch`):
-#                    body = { "items": [{ "batteryAssetId": "<guid>", ..., "sourceDeviceId": "<string>" }] }
-#                    header = X-Api-Key (KHÔNG có X-Device-Code, KHÔNG có Idempotency-Key, KHÔNG có DeviceTimestamp wrapper)
-# `iot2-production`— production contract Sprint IoT-2 #IoT2-14 (chưa merge):
-#                    body = { "DeviceTimestamp": "...", "Readings": [{ "BatteryAssetSerial": "...", "SourceType": 1|2,
-#                             "SensorSourceCode": "primary|redundant|external-temp", "BmsErrorCode": "≤64chars", ... }] }
+# `current`        — Sprint 1 legacy contract (firmware buildLegacyBatchPayload + backend SensorReadingItem):
+#                    body = { "items": [{ "batteryAssetId": "<guid>", "time", "voltage", "current",
+#                             "temperature", "socPercent", "cycleCount" }] }
+#                    header = X-Api-Key (KHÔNG có X-Device-Code / Idempotency-Key)
+# `iot2-production`— Sprint 3 production contract (firmware buildProductionBatchPayload — S3-FW-04):
+#                    ⚠ KHỚP CHÍNH XÁC firmware ESP32 + backend BatchIngestSensorReadingsCommand.Items:
+#                    body = { "items": [{ "batteryAssetSerial": "...", "time", "deviceTimestamp",
+#                             "voltage", "current", "temperature", "socPercent", "cycleCount",
+#                             "sourceType": 1|2|3, "sensorSourceCode": "primary|redundant|external-temp",
+#                             "sohPercent"?, "chargingState"?, "bmsErrorCode"? }] }
 #                    header = X-Api-Key + X-Device-Code + Idempotency-Key
+#                    KHÔNG có wrapper "DeviceTimestamp"/"Readings" — backend chỉ bind `Items` (camelCase).
 CONTRACT_CURRENT = "current"
 CONTRACT_IOT2 = "iot2-production"
 VALID_CONTRACTS = {CONTRACT_CURRENT, CONTRACT_IOT2}
@@ -66,6 +71,7 @@ class DeviceConfig:
     sensors: SensorToggles
     scenario: str = "normal"
     sensor_drift: SensorDrift = field(default_factory=SensorDrift)
+    ntp_server: str = "time.google.com"   # firmware provision default; override từ provision response
 
 
 @dataclass
@@ -79,6 +85,7 @@ class BackendConfig:
     retry_base_s: float
     retry_max_s: float
     retry_jitter_pct: float
+    ota_check_interval_s: float = 3600.0   # firmware OTA_CHECK_INTERVAL_MS = 1h (S7)
 
 
 @dataclass
@@ -132,6 +139,7 @@ def load_config(seed_path: Path | str | None = None) -> SimulatorConfig:
         retry_base_s=float(be_raw.get("retry_base_s", 2)),
         retry_max_s=float(be_raw.get("retry_max_s", 300)),
         retry_jitter_pct=float(be_raw.get("retry_jitter_pct", 20)),
+        ota_check_interval_s=float(be_raw.get("ota_check_interval_s", 3600)),
     )
 
     mq_raw = raw.get("mqtt", {})
