@@ -1,302 +1,438 @@
-# IoT Simulator — Solar Battery (ESP32-S3 mock)
+# IoT Simulator — bản demo `iot → backend` không cần phần cứng
 
-Simulator Python mô phỏng **đầy đủ** chức năng firmware ESP32-S3 dự án IoT Capstone GSU26SE55, dùng khi **chưa có hardware thật**. Chạy end-to-end các luồng vận hành B1–B7 (`overall.iot.md`) và contract Sprint IoT-1 → IoT-6 mà không cần pin/BMS/MAX485.
+Mô phỏng **thiết bị ESP32-S3 chạy firmware thật** của repo `capstone/iot`, nhưng bỏ hết phần cứng:
+không BMS, không pin, không RS485/I2C/1-Wire, không Wi-Fi riêng. Mọi thứ **đi ra dây** — endpoint,
+header, hình dạng JSON, thứ tự trạng thái, cách xử lý lỗi — thì giống thiết bị thật 1:1.
 
-> **Phạm vi:** thay phần `Site / BMS / ESP32` trong sơ đồ `newiot.md §4` bằng simulator này. Backend (`BatteryService`), broker (EMQX/Mosquitto), DB (TimescaleDB), TicketService, NotificationService chạy thật như môi trường dev.
-
----
-
-## ⚠ Quan trọng: chọn `contract_version`
-
-Backend `BatteryService` đang ở giữa quá trình migrate Sprint IoT-2. Có 2 contract:
-
-| Mode | Endpoint hoạt động hôm nay | Khi nào dùng |
-|---|---|---|
-| **`current`** (mặc định) | `POST /api/sensor-readings/batch` với `items[].batteryAssetId` (Guid) **theo Sprint 1 legacy contract** (`tasksprint.md` S1-FW-05 + `newiot.md §7.4`). Header: `X-Api-Key` only. KHÔNG có `sourceDeviceId`, `X-Device-Code`, `Idempotency-Key`, `DeviceTimestamp` wrapper, `SourceType` field. | Backend hôm nay accept legacy. Yêu cầu `batteries[].battery_asset_id` Guid trong `seed.yaml`. |
-| **`iot2-production`** | `{ items[]: { batteryAssetSerial, time, deviceTimestamp, voltage, current, temperature, socPercent, cycleCount, sourceType, sensorSourceCode, sohPercent?, chargingState?, bmsErrorCode? } }` — **KHỚP firmware `buildProductionBatchPayload`**. Header thêm `X-Device-Code` + `Idempotency-Key`. + endpoint `/api/iot-devices/{provision,heartbeat,firmware-check,firmware-update-log}` + MQTT per-pin. | Production contract (S3-FW-04). Dùng `batteryAssetSerial` thay Guid. ⚠ Xem audit #10 — backend còn 1 bug idempotency chặn ingest. |
-
-Đổi bằng `backend.contract_version` trong `seed.yaml` hoặc env `IOT_CONTRACT_VERSION=iot2-production`.
-
----
-
-## Cấu trúc
+Mục tiêu: chạy được **toàn bộ luồng `iot ↔ backend`** trên một chiếc laptop.
 
 ```
-iot-simulator/
-├── README.md                ← file này
-├── Makefile                 ← venv / run / test / provision
-├── requirements.txt
-├── env.example.txt          ← copy thành .env
-├── config/
-│   └── seed.yaml            ← devices + batteries + scenarios
-├── scripts/
-│   ├── run.sh               ← quick start
-│   └── provision_devices.py ← gọi admin POST /api/v1/admin/iot-devices (chỉ contract iot2)
-├── src/
-│   ├── main.py              ← CLI entry — python -m src.main
-│   ├── config.py            ← load seed.yaml + contract_version validator
-│   ├── bms.py               ← MockBattery: SOC/OCV/heat physics + 11 scenarios, pinned timestamp
-│   ├── sensors/
-│   │   ├── redundant.py     ← INA226 (V/I) + DS18B20 (temp) — sourceType=IotGateway
-│   │   ├── ambient.py       ← SHT31 → /api/ambient/readings/batch  (source=1 IotSensor)
-│   │   └── environmental.py ← MQ-2 smoke / fire / gas leak + water flood → /api/environmental-incidents (int enums)
-│   ├── http_client.py       ← HTTPS REST — header & path theo contract + firmware-update-log PUT
-│   ├── mqtt_client.py       ← MQTT (paho-mqtt) — LWT + telemetry per-pin/heartbeat/status/cmd/cmd-ack
-│   ├── queue.py             ← Local JSONL queue + endpoint routing khi flush
-│   ├── ota.py               ← OTA decision (ota_should_update) + runner lifecycle (S7)
-│   ├── device.py            ← SimulatedDevice — vòng đời ESP32 + scenarios + cmd downlink + OTA + LED
-│   └── dashboard.py         ← Rich live dashboard (LED + FW + OTA cols)
-├── tests/  (44 tests — 100% PASS)
-│   ├── test_bms.py          ← 11 scenarios + pinned timestamp + ChargingState enum
-│   ├── test_payload.py      ← cả 2 contract (items[] camelCase) + cross-source + ambient + incident
-│   └── test_features.py     ← MQTT topic/command schema + provision-apply + OTA decision/lifecycle
-└── logs/queue/              ← JSONL per device (auto-create)
+┌────────────────────┐        HTTPS  +  MQTT        ┌──────────────────┐
+│  iot-simulator     │ ───────────────────────────► │  BatteryService  │
+│  (thay ESP32-S3)   │ ◄─────────────────────────── │  + broker + DB   │
+└────────────────────┘   provision · telemetry ·    └──────────────────┘
+                          heartbeat · ambient ·
+                          sự cố · OTA · lệnh downlink
 ```
 
----
-
-## Coverage matrix — đối chiếu với tasksprint.md + api-battery.md
-
-| Spec đầu vào | Implementation |
-|---|---|
-| **S1-FW-04..07** mock BMS scenarios + HTTPS POST | `bms.py` + `device._tick_ingest` |
-| **S2-FW-02/03** provision + heartbeat 60s (chip temp/heap/RSSI/queue depth, Cpu/Disk=null) | `device._do_provision` + `_send_heartbeat` (chỉ `iot2-production`) |
-| **S2-FW-04** header `X-Api-Key`+`X-Device-Code` | `http_client` tự gắn theo `contract_version` |
-| **S3-FW-01** local queue (NVS) | `queue.LocalQueue` (JSONL) — flush đúng endpoint khi resume |
-| **S3-FW-02** Idempotency-Key UUIDv4 | `device._tick_ingest` gen `uuid.uuid4()`; chỉ gửi nếu contract iot2 |
-| **S3-FW-03** exponential backoff + jitter | `device._bump_backoff` (base 2s, max 300s, jitter ±20%) |
-| **S3-FW-04** production contract `deviceTimestamp` + `sourceType` per-source + `bmsErrorCode ≤64 chars` | `device._build_ingest_payload` + `_bms_to_dict` + `_gw_to_dict` |
-| **S4-FW-01..06** MQTT + LWT + cmd subscribe + cmd/ack publish + fallback HTTPS | `mqtt_client.py` (telemetry per-pin `solar/{dev}/{serial}/telemetry`) + `device._on_mqtt_command` (schema `{cmdId,type,params}` → ack `{cmdId,status,error?}`) + MQTT-first streak threshold=3 |
-| **S5-FW-01** BMS reading + `bmsErrorCode` | `bms.py` (OVP/UVP/OTP/OCD/scenario `bms_error`) |
-| **S5-FW-04** INA226 `sourceType=2/redundant` | `sensors/redundant.make_ina226_reading` |
-| **S5-FW-05** DS18B20 `sourceType=2/external-temp` | `sensors/redundant.make_ds18b20_reading` |
-| **S5-FW-06** SHT31 → `/api/ambient/readings/batch` `source=1 IotSensor` | `sensors/ambient.py` + `device._send_ambient` (đúng path & field names api-battery.md) |
-| **S6-FW-01** MQ-2 → environmental incident | `sensors/environmental.make_smoke_incident` (int enum) |
-| **S6-FW-02** water leak → flood incident | `make_water_leak_incident` → `incidentType=4` (Flood) |
-| **S6-FW-03** cross-source pair BMS vs IotGateway cùng phút | pinned `time_iso` per tick — verified bởi `test_pinned_timestamp_across_sources` |
-| **S7-FW-01/02** OTA: firmware-check → decision → update-log lifecycle → version bump | `ota.py` (`ota_should_update` + `OtaRunner`) + `device._do_ota_check` mỗi 1h (firmware `OTA_CHECK_INTERVAL_MS`); `trigger_ota` cmd chạy ngay |
-| **S2-FW-02** provision response apply (polling/heartbeat/siteId/ntp) | `device._apply_provision_response` (siteId backend-assigned override seed) |
-| **LedState** Online/Queued/Offline/Provisioning | `device._update_led` + `dashboard` cột LED |
-| **ChargingStateEnum** Idle/Charging/Discharging/Float/Bypass = 1..5 | `bms.py` (sửa từ Full=4 → Float=4) |
+Đối chiếu từng dòng với `capstone/iot/firmware-esp32/src/**` — mỗi module Python đều ghi rõ nó
+mirror file C++ nào.
 
 ---
 
-## Scenario engine — 17 kịch bản, map 1-1 với AnomalyType + EnvironmentalIncidentType backend
-
-| Scenario | Backend enum |
-|---|---|
-| `normal` | (không trigger) |
-| `overheat` | `AnomalyType=1 Overheat` (P1) |
-| `overvoltage` | `AnomalyType=2` |
-| `undervoltage` | `AnomalyType=3` |
-| `low_soc` | `AnomalyType=4` (P2) |
-| `rapid_discharge` | `AnomalyType=5` |
-| `abnormal_charging` | `AnomalyType=6` |
-| `device_offline` | `AnomalyType=7` (sau 60s ngừng heartbeat → backend job 2 phút detect, hoặc MQTT LWT tức thì) |
-| `soh_degradation` | `AnomalyType=8` |
-| `high_ambient_temp` | `AnomalyType=9` (SHT31 → `/api/ambient/readings/batch`) |
-| `high_humidity` | `AnomalyType=10` |
-| `high_temp_humidity_combo` | `AnomalyType=11` |
-| `sensor_mismatch` | `AnomalyType=15` (INA226 lệch > 0.5V hoặc DS18B20 lệch > 5°C) |
-| `smoke` | `EnvironmentalIncidentType=1 Smoke` (Critical) |
-| `fire_detected` | `EnvironmentalIncidentType=2 FireDetected` |
-| `gas_leak` | `EnvironmentalIncidentType=3 GasLeak` |
-| `water_leak` | `EnvironmentalIncidentType=4 Flood` |
-| `bms_error` | `bms_error_code = "OVT-PROTECT"` |
-| `clock_skew` | `deviceTimestamp` lệch +10 phút → backend reject (Sprint IoT-2 `#IoT2-15`) |
-
----
-
-## Quick start
+## 1. Chạy trong 2 phút
 
 ```bash
-cd iot-simulator
-make install                       # tạo venv + cài deps
-cp env.example.txt .env            # sửa IOT_BASE_URL + IOT_API_KEY
-# (contract current) lấy battery_asset_id từ DB → điền vào config/seed.yaml
-make run                           # rich dashboard
-# hoặc
-python -m src.main --no-dashboard
-python -m src.main --once                       # smoke test
-python -m src.main --scenario overheat
-python -m src.main --device ESP32-SIM-001
+make install                      # tạo .venv + cài phụ thuộc
+
+# (A) Chạy với backend THẬT
+IOT_BASE_URL=http://localhost:4001 make run
+
+# (B) Chạy với backend GIẢ kèm sẵn — không cần dựng gì thêm
+make mock                         # cửa sổ 1: backend giả, kiểm hợp đồng nghiêm ngặt
+make demo                         # cửa sổ 2: simulator trỏ vào backend giả
 ```
 
-### Provision device (chỉ contract iot2-production)
+`make demo` sẽ: provision → nhận cấu hình + bảng pin từ backend → đẩy telemetry đa nguồn mỗi 5s →
+heartbeat mỗi 60s → ambient mỗi 60s → và cập nhật bảng trạng thái trực tiếp trên terminal.
 
-Khi backend đã có admin endpoint (Sprint IoT-2 `#IoT2-07`):
+Lệnh khác:
+
+```bash
+make once            # gửi một batch rồi thoát (smoke test)
+make test            # 313 unit test
+make clean-state     # xoá state bền vững → thiết bị "mới bóc hộp", provision lại từ đầu
+make mock-ota        # backend giả có offer OTA 1.2.0 (tải thật + xác minh SHA-256 thật)
+```
+
+---
+
+## 2. Nó làm được đúng những gì `iot` làm với backend
+
+| Luồng | Endpoint / topic | Trạng thái |
+|---|---|---|
+| **Provision** | `POST /api/iot-devices/provision` | ✅ đọc **đủ** response: chu kỳ, siteId, ntpServer, **6 trường MQTT**, **`batteryMappings[]`** |
+| **Telemetry** | `POST /api/sensor-readings/batch` | ✅ contract production, đa nguồn (BMS + INA226 + DS18B20), `Idempotency-Key` |
+| **Telemetry (MQTT)** | `<prefix>/<serial>/telemetry` | ✅ MQTT-first, **mỗi pin một message**, fallback HTTPS |
+| **Heartbeat** | `POST /api/iot-devices/heartbeat` | ✅ đúng tập trường của `IotDeviceHeartbeatCommand`, đọc cảnh báo lệch giờ |
+| **Ambient (SHT31)** | `POST /api/ambient/readings/batch` | ✅ chu kỳ 60s, `source=1` (số), không có `solarIrradiance` |
+| **Sự cố môi trường** | `POST /api/environmental-incidents` | ✅ MQ-2 → `GasLeak(3)`, rò nước → `Flood(4)`, có warm-up + hạ nhiệt 5' |
+| **OTA** | `GET firmware-check` · `PUT firmware-update-log/{id}` | ✅ tải artifact thật, xác minh SHA-256 thật, verify-mode 2', **rollback**, chống re-OTA loop |
+| **Lệnh downlink** | `<prefix>/cmd` → `<prefix>/cmd/ack` | ✅ `set_interval` · `request_heartbeat` · `trigger_ota`, ack `ok/failed/unknown/rejected` |
+| **Trạng thái** | `<prefix>/status` | ✅ `online` retain + **LWT `offline`** retain (phát hiện mất kết nối tức thì) |
+| **Hàng đợi ngoại tuyến** | — | ✅ trần 200 batch, drop-oldest, đẩy bù 1 batch/vòng có backoff |
+| **Xin lại credential** | `POST /provision` | ✅ broker từ chối xác thực 5 lần → re-provision, hạ nhiệt 15' |
+
+Có bản đối chiếu chi tiết ở **§7 — Bảng đối chiếu firmware**.
+
+---
+
+## 3. Chọn contract
+
+```yaml
+backend:
+  contract_version: iot2-production     # MẶC ĐỊNH
+```
+
+| Giá trị | Ý nghĩa |
+|---|---|
+| **`iot2-production`** | Contract Sprint 3 — **contract DUY NHẤT mà firmware ESP32 thật chạy**. Có đủ provision / heartbeat / MQTT / ambient / sự cố / OTA / `Idempotency-Key`. Định danh pin bằng `batteryAssetSerial`. |
+| `current` | Contract Sprint 1 cho backend đời cũ: chỉ `POST /api/sensor-readings/batch` với `items[].batteryAssetId` (Guid), header chỉ `X-Api-Key`. Mọi tính năng trên **tự tắt**. Bắt buộc điền `batteries[].battery_asset_id`. |
+
+Đổi bằng `seed.yaml` hoặc `IOT_CONTRACT_VERSION=current`.
+
+---
+
+## 4. Nguồn chân lý của cấu hình
+
+`config/seed.yaml` đóng đúng vai trò của `firmware-esp32/include/config.h`: **chỉ là đường lui**.
+
+```
+lần chạy đầu:   seed.yaml ──► POST /provision ──► backend trả cấu hình thật
+                                                       │
+lần chạy sau:   logs/state/<device>.nvs.json ◄─────────┘   (tương đương NVS của ESP32)
+```
+
+Backend quyết định: `pollingIntervalSeconds`, `heartbeatIntervalSeconds`, `siteId`, `ntpServer`,
+6 trường MQTT (`mqttBrokerHost/Port/UseTls/TopicPrefix/Username/Password`), và
+`batteryMappings[]` (serial ↔ unitId ↔ sensorSourceCode).
+
+> ⚠ Đo trên stack đang chạy ngày 2026-08-11: **backend đang deploy chưa trả trường `mqtt*` nào**
+> (mã nguồn đã có IOT3-27/42 nhưng image thì chưa), nên simulator chạy HTTPS-only cho tới khi
+> backend được build lại. Cách demo MQTT ngay: `guideline.md §13`.
+
+Trạng thái bền vững cũng giữ **version firmware đang chạy** (để OTA có ý nghĩa qua các lần chạy)
+và **máy trạng thái OTA** (`otaPend/otaBootN/otaRb/otaBadVer/…`).
+
+```bash
+make clean-state                       # hoặc: python -m src.main --clear-state
+python -m src.main --no-persist        # không ghi state — mỗi lần chạy là thiết bị mới tinh
+```
+
+---
+
+## 5. Kịch bản
+
+Đặt ở `devices[].scenario`, hoặc `--scenario`, hoặc **gửi lệnh MQTT lúc đang chạy**:
+`{"cmdId":"x","type":"set_scenario","params":{"scenario":"overheat"}}`.
+
+| Nhóm | Kịch bản |
+|---|---|
+| Pin (BMS) | `normal` · `overheat` · `overvoltage` · `undervoltage` · `low_soc` · `rapid_discharge` · `abnormal_charging` · `soh_degradation` · `bms_error` |
+| Chéo nguồn | `sensor_mismatch` — INA226 lệch > 0,5V và DS18B20 lệch > 5°C, đủ vượt ngưỡng `SensorMismatch` |
+| Môi trường | `high_ambient_temp` · `high_humidity` · `high_temp_humidity_combo` |
+| Sự cố an toàn | `gas_leak` · `smoke` → `GasLeak(3)` · `water_leak` → `Flood(4)` · `fire_detected` → `FireDetected(2)` |
+| Vận hành | `device_offline` (dừng sau 60s để demo LWT) · `clock_skew` (+10 phút, kích hoạt kiểm tra #IoT2-15) |
+
+---
+
+## 6. Cấu trúc mã nguồn
+
+Mỗi file ghi rõ nó mirror file nào bên `capstone/iot/firmware-esp32/src/`.
+
+```
+src/
+├── main.py            CLI                          ← (không có bên firmware)
+├── device.py          vòng lặp chính               ← main.cpp
+├── config.py          nạp seed                     ← include/config.h
+│
+├── timeutil.py        mốc thời gian ISO8601        ← net/time_sync.cpp
+├── backoff.py         backoff + phân loại lỗi      ← net/backoff.{h,cpp}
+├── policy.py          các quyết định thuần         ← core/{ingest,ota_check,reprovision}_policy.h
+├── payload.py         dựng JSON batch              ← core/payload.{h,cpp} + core/reading_filter.h
+├── ingest_result.py   đọc `inserted/skipped`       ← core/ingest_result.{h,cpp}
+├── net_rules.py       kiểm định danh + topic       ← core/{identity_validation,net_config_rules}.h
+├── battery_map.py     bảng ánh xạ pin              ← core/battery_map_codec.h + config/battery_map_runtime.cpp
+├── nvs.py             state bền vững               ← config/nvs_store.cpp
+├── link.py            trạng thái đường lên          ← net/wifi_manager.cpp
+├── led.py             đèn trạng thái (8 màu/kiểu)  ← ui/{status_led,led_palette}.h
+│
+├── http_client.py     REST                         ← net/http_client.cpp
+├── mqtt_config.py     cấu hình broker runtime      ← config/mqtt_config.cpp
+├── mqtt_client.py     MQTT                         ← net/mqtt_client.cpp
+├── provision.py       luồng provision              ← provision/provision.cpp
+├── heartbeat.py       heartbeat                    ← telemetry/heartbeat.cpp
+├── cmd.py             lệnh downlink                ← cmd/{cmd_logic,command_handler}.cpp
+├── ota.py             OTA + rollback               ← ota/ota_update.cpp + ota/ota_decision.h
+├── bms.py             mô hình pin                  ← bms/mock_bms.cpp
+├── dashboard.py       bảng trạng thái terminal     ← (không có bên firmware)
+├── sensors/
+│   ├── redundant.py         INA226 + DS18B20       ← bms/mock_bms.cpp (multi-source)
+│   ├── ambient.py           SHT31                  ← sensor/sht31.cpp
+│   ├── environmental.py     reporter sự cố         ← sensor/environmental_incident.cpp
+│   ├── incident_trigger.py  cạnh lên + hạ nhiệt    ← sensor/incident_trigger.h
+│   ├── mq2.py               MQ-2                   ← sensor/mq2.cpp
+│   ├── water_leak.py        rò nước                ← sensor/water_leak.cpp
+│   └── fire_watch.py        báo cháy               ← ⚠ RIÊNG của simulator
+└── anomaly.py         bộ chạy dataset anomaly      ← ⚠ RIÊNG của simulator (§11)
+
+config/anomaly-dataset.yaml   26 case demo cảnh báo (phủ 17/17 loại) — xem §11
+tools/mock_backend.py         backend giả, kiểm hợp đồng nghiêm ngặt
+tests/                        313 unit test
+```
+
+---
+
+## 7. Bảng đối chiếu firmware
+
+### 7.1 Đã mô phỏng đúng
+
+| Hạng mục | Chi tiết |
+|---|---|
+| Mốc thời gian | `%Y-%m-%dT%H:%M:%SZ` — **độ phân giải giây**, đúng `net::isoNow` |
+| Mili-giây per-item | `time`/`deviceTimestamp` = mốc chung + `.{index:03d}` → khoá chính `(Time, BatteryAssetId)` không đụng |
+| Nhóm MQTT | mỗi pin một message, index ms **đánh lại từ 0** trong mỗi nhóm |
+| Header | `X-Api-Key` + `X-Device-Code` + `Accept`; `Idempotency-Key` **chỉ** cho ingest |
+| Phân loại lỗi | 4xx (trừ 408/429) = vĩnh viễn → **BỎ**; 0/5xx/408/429 = tạm thời → xếp hàng + backoff 2s→5' ±20% |
+| Nhận thiếu | đọc `{totalReceived, inserted, skipped}` trong 2xx và **la lên** |
+| Publish một phần | serial đã vào backend qua MQTT **không** bị gửi lại qua HTTPS |
+| Mất mạng | vẫn lấy mẫu + xếp hàng, khoá idempotency sinh **lúc lấy mẫu** |
+| Hàng đợi | trần 200 batch, drop-oldest, đẩy bù 1 batch/vòng có backoff |
+| Cảm biến an toàn | chạy **vô điều kiện** kể cả khi mất mạng; `detectedAt` = lúc **phát hiện** |
+| OTA | Downloading→Installing→Success / Failed / Skipped / RolledBack; boot-counter; chặn version hỏng sau 3 lần |
+| Broker | LWT `offline` retain, `online` retain, QoS **0**, trần gói **4096 byte** |
+| Xác thực broker | đếm riêng lỗi xác thực (rc 4/5); 5 lần → re-provision, hạ nhiệt 15' |
+| Định danh | từ chối giá trị có khoảng trắng/CR/LF (chống tiêm header `X-Api-Key`) |
+| Đèn | 8 trạng thái + 3 kiểu nháy, trạng thái **mạng** ưu tiên trên trạng thái hàng đợi |
+
+### 7.2 Cố ý khác — và vì sao
+
+| Điểm khác | Lý do |
+|---|---|
+| **`LocalQueueDepth` gửi số THẬT** | Firmware vẫn hard-code `0` kèm chú thích "Sprint 3 sẽ có queue thật", trong khi hàng đợi đã tồn tại từ Sprint 3. Gửi 0 chỉ để "giống bug" là làm hỏng đúng tính năng mà trường này sinh ra. |
+| **Nguồn phụ sao chép giá trị BMS** thay vì gửi `0.0` | Backend coi `voltage ∉ (0,1000]` là outlier và **>50 outlier/giờ thì tự khoá thiết bị**. DS18B20 chỉ đo nhiệt; gửi `voltage: 0.0` với chu kỳ 5s là 720 outlier/giờ. `mockGenerateMultiSource` của firmware sao chép giá trị BMS đúng vì lý do này. |
+| **Đẩy hàng đợi không bị chặn theo trạng thái mạng** | Firmware có driver Wi-Fi tự dò lại mạng; simulator không có, "có mạng" chỉ suy ra được từ kết quả request. Chặn theo trạng thái mạng thì một khi mất kết nối sẽ không còn request nào để phát hiện lúc backend sống lại. Vẫn bị backoff ghìm nên không nện backend. |
+| **Trạng thái đường lên khởi đầu là "có kết nối"** | Ảnh phản chiếu của firmware: Wi-Fi đã associate trước lần POST đầu tiên. |
+| Lệnh `set_scenario` | Mở rộng riêng để demo; firmware trả `unknown`. |
+| Kịch bản `fire_detected` | Mở rộng riêng; firmware **không có** đường báo cháy (chỉ MQ-2→GasLeak và rò nước→Flood). |
+
+### 7.3 Không có (và không cần)
+
+Wi-Fi/AP `SolarGW-xxxx`, trang cấu hình web + quét QR, Serial CLI, Modbus RS485/JK-BMS, I2C/1-Wire
+thật, ghi OTA partition + rollback bootloader, TLS bằng CA cert nạp từ LittleFS.
+Đây đều là phần **phần cứng / cấu hình tại chỗ**, không nằm trên đường `thiết bị ↔ backend`.
+
+---
+
+## 8. Điều kiện phía backend
+
+Ba thứ dưới đây không phải lỗi của simulator, nhưng làm hỏng demo nếu bỏ qua
+(nguồn: `capstone/iot/iot-backend-contract-gaps.md`):
+
+1. **Scope `EnvironmentalIngest` (bitmask 4).** `EdgeDeviceDefault` = `SensorIngest | DeviceHeartbeat
+   | FirmwareCheck` = **11, KHÔNG có 4**. Thiếu nó thì ambient + sự cố môi trường trả **403**, và
+   403 là lỗi vĩnh viễn nên bị BỎ. Cấp key với scope tổng = **15**.
+2. **`Mqtt__Enabled=true`.** Mặc định của backend là `false`. Broker vẫn nhận publish bất kể
+   backend có subscribe hay không ⇒ tắt bridge là **mất telemetry hoàn toàn trong im lặng**.
+3. **Ngưỡng outlier.** >50 reading ngoài dải vật lý trong một giờ ⇒ backend tự chuyển thiết bị sang
+   `Decommissioned`, mọi request sau trả 409. Kịch bản `normal` của simulator luôn nằm trong dải
+   (có test chặn), nhưng các kịch bản cực đoan chạy dài thì cần biết điều này.
+
+---
+
+## 9. Backend giả (kiểm hợp đồng nghiêm ngặt)
+
+`tools/mock_backend.py` **khắt khe hơn ASP.NET Core một cách có chủ ý**: backend thật bind JSON
+không phân biệt hoa thường và bỏ qua trường lạ, nên nó *che mất* chỗ payload sai. Mock này từ chối
+thẳng để lỗi lộ ra ngay.
+
+```bash
+python3 tools/mock_backend.py --port 4001
+python3 tools/mock_backend.py --port 4001 --offer-version 1.2.0        # thử OTA trọn vòng
+python3 tools/mock_backend.py --port 4001 --mqtt-host localhost \
+        --mqtt-port 1883 --mqtt-pass demo                              # cấp broker qua provision
+
+curl -s localhost:4001/ | python3 -m json.tool     # tóm tắt + danh sách vi phạm hợp đồng
+```
+
+Nó kiểm: header bắt buộc, định dạng ISO8601, kiểu số nguyên của `MemoryUsageMb`, enum phải là số,
+`Idempotency-Key` (trả lại kết quả cũ khi trùng), trùng khoá chính trong cùng batch, dải vật lý
+(→ đếm vào `skipped`), `notes ≤ 1000`, `failureReason ≤ 500`, `detectedAt` không ở tương lai quá 5'.
+
+---
+
+## 10. Kiểm thử
+
+```bash
+make test          # 313 test, chạy < 0,7s, không cần mạng
+```
+
+| Tệp | Phủ |
+|---|---|
+| `test_payload.py` | hình dạng JSON hai contract, mili-giây per-item, tag chéo nguồn, bẫy outlier |
+| `test_bms.py` | 9 kịch bản pin + bất biến "không sinh outlier" |
+| `test_provision.py` | envelope, biên, 6 trường MQTT, `batteryMappings[]`, retry 30s, state qua khởi động lại |
+| `test_resilience.py` | phân loại lỗi, backoff, trần hàng đợi, đẩy bù, GH-737/740/748, đèn |
+| `test_ota.py` | trọn vòng OTA, checksum sai, rollback, boot-loop, chặn version hỏng |
+| `test_sensors.py` | cạnh lên + hạ nhiệt, MQ-2→GasLeak, `detectedAt` lùi đúng, SHT31 60s |
+| `test_mqtt_client.py` | topic, trần gói, đếm lỗi xác thực, **chống tự khoá luồng mạng** |
+| `test_http_contract.py` | header, method, route, body — chạy trên client THẬT |
+| `test_features.py` | lệnh downlink, heartbeat, đèn, luật định danh, re-provision |
+| `test_anomaly.py` | dataset anomaly: phủ trọn enum, chia đợt, ô thời gian, case xung đột/nguy hiểm, từng case vượt đúng ngưỡng |
+
+Đã kiểm end-to-end: backend giả (0 vi phạm hợp đồng), broker MQTT thật (telemetry per-pin, ack
+downlink, LWT `offline` sau khi `kill -9`), và ngắt backend giữa chừng (hàng đợi lên 6 batch,
+backoff 1,8s→14s, đẩy bù đủ, **không mất và không trùng bản ghi nào**).
+
+---
+
+## 11. Demo cảnh báo (anomaly)
+
+`config/anomaly-dataset.yaml` + `python -m src.anomaly` đẩy **đúng số đo cần thiết** để backend
+dựng từng loại cảnh báo. Payload đi qua **cùng đường gửi** với lúc chạy bình thường
+(`payload.py` + `http_client.py`) — không có nhánh riêng cho demo.
+
+```bash
+make anomaly-list      # 26 case + điều kiện của từng case
+make anomaly-check     # backend đã đủ điều kiện chưa (KHÔNG gửi gì)
+make anomaly-dry       # in payload thật sẽ gửi
+make anomaly           # chạy lượt thường (~90 giây)
+make anomaly-verify    # in câu SQL kiểm chứng + dọn để demo lại
+```
+
+**Phủ TRỌN 17/17 giá trị `AnomalyTypeEnum` của backend.** Có test bất biến chặn hồi quy:
+`EnumCoverageTest.test_every_backend_anomaly_type_has_a_case` sẽ đỏ nếu backend thêm loại mới mà
+dataset chưa theo kịp.
+
+### Kết quả đã kiểm trên backend thật
+
+| Cảnh báo | Mức | Phạm vi | Giá trị | Case |
+|---|---|---|---|---|
+| Overheat | Warning / Critical | BAT‑2026‑001 / ‑002 | 62 °C / 72 °C | 1, 2 |
+| Undertemp | Warning / Critical | BAT‑2026‑001 | −12 °C / −18 °C | 3, 4 |
+| Overvoltage · Undervoltage | Critical | BAT‑2026‑001 | 15,2 V · 9,5 V | 5, 6 |
+| LowSoc | Warning / Critical | BAT‑2026‑001 / ‑003 | 15 % / 8 % | 7, 8 |
+| RapidDischarge · AbnormalCharging | Critical | BAT‑2026‑REAL‑001 | −130 A · 45 A | 9, 10 |
+| SohDegradation | Warning / Critical | BAT‑2026‑001 / ‑004 | 82 % / 72 % | 11, 12 |
+| HighInternalResistance · CellImbalance | Critical | BAT‑2026‑001 | 65 mΩ · 135 mV | 13, 14 |
+| SensorMismatch | Warning | BAT‑2026‑001 | Δ 0,6 V | 16 |
+| HighAmbientTemp | **Warning** / Critical | site | 40 °C / 48 °C | **24**, 17 |
+| HighHumidity | Warning / **Critical** | site | 83 % / 94 % | 18, **25** |
+| HighTempHumidityCombo | Critical | site | 39 °C + 87 % | 19 |
+| **EnvironmentalIncident** | Critical | site | GasLeak · Flood · FireDetected | **21, 22, 23** |
+| **IotDataIntegrityViolation** | Critical | thiết bị | 60 số đo phi vật lý | **26** ⚠ |
+| DeviceOffline | Warning | thiết bị | im lặng > 10 phút | 15 (chạy tay) |
+
+Case 20 đúng như thiết kế là **không** sinh cảnh báo nào — nó chỉ kiểm rằng backend nhận đúng
+trường `bmsErrorCode`.
+
+### Bốn case KHÔNG chạy trong lượt thường — và vì sao
+
+| Case | Lý do | Cách chạy |
+|---|---|---|
+| **24** HighAmbientTemp Warning | Backend khử trùng cảnh báo ambient theo `(site, loại)` trong 1 giờ, **không phân biệt mức** — gửi cùng lượt với case 17 thì bị nuốt IM LẶNG | `run --case 24` sau khi dọn cảnh báo cũ |
+| **25** HighHumidity Critical | Cùng lý do, loại trừ case 18 | `run --case 25` |
+| **26** IotDataIntegrityViolation | 🔴 Làm thiết bị bị vô hiệu hoá **vĩnh viễn** | `run --case 26 --include-dangerous` |
+| **15** DeviceOffline | Là điều kiện thời gian, không gửi được | ngừng gửi > 10 phút |
+
+Bộ chạy tự phát hiện và in ra lý do + lệnh chạy riêng, thay vì gửi rồi để bạn đi tìm một cảnh báo
+không bao giờ tồn tại.
+
+### Bốn chỗ tài liệu gốc ghi SAI so với backend đang chạy — đã sửa trong dataset
+
+1. **Overheat Critical delta là +5 °C**, không phải +8 (`AnomalyRules.OverheatCriticalDeltaC`).
+2. **Ambient: cảnh báo 38 / nguy cấp 42; kết hợp là temp ≥ 35 VÀ ẩm ≥ 75** (tài liệu ghi 40/45 và
+   38/85). Kèm theo: 39 °C + 87 % sinh **ba** cảnh báo chứ không phải một — luật kết hợp là nhánh
+   độc lập, không phải `else`.
+3. **RapidDischarge/AbnormalCharging không thể demo trên pin NMC**: `current_max_charge/discharge`
+   của NMC (và của LiFePO4 12V, NCA) đều `NULL` ⇒ luật không bao giờ chạy. Loại pin **duy nhất**
+   trong DB có hai ngưỡng đó là **LiFePO4 24V 30Ah (`BAT-2026-REAL-001`)** — sạc 30 A, xả 100 A.
+4. **Mốc thời gian cố định `2026-08-08` sẽ không bao giờ được xét**: bộ quét chỉ nhìn lại 20 giây,
+   và `deviceTimestamp` lệch quá 5 phút thì backend trả 400 cho cả batch. Bộ chạy luôn tự đặt mốc
+   "vừa xong".
+
+### Ba ràng buộc vận hành khiến "gửi một phát" KHÔNG bao giờ đủ
+
+Đây là phần khó nhất, và là lý do bộ chạy có cấu trúc như hiện tại:
+
+- **Chống nhiễu đếm theo bản đã ghi vào DB.** Mỗi lượt quét đọc số breach đã persist *trước* lượt
+  đó rồi cộng 1 cho số đo đang xét — breach của chính lượt này còn đang chờ ghi nên không được
+  đếm. Gửi 6 số đo một lượt ⇒ cả 6 đều ra `1 < 5` ⇒ **bị bỏ qua hết**.
+  ⇒ Bộ chạy chia **2 đợt**: đợt 1 đúng 5 số đo, chờ 14 giây cho chúng được ghi, rồi đợt 2 gửi
+  thêm 2 — lúc này `5 + 1 = 6 ≥ 5` ngay ở lượt quét đầu tiên của đợt 2.
+- **Khoá chính `(Time, BatteryAssetId)`.** Hai case cùng pin chạy trong cùng một giây sẽ đụng
+  khoá; backend đếm vào `skipped` và case sau mất dữ liệu trong im lặng.
+  ⇒ Bộ chạy cấp cho mỗi case một **giây riêng theo từng pin**.
+- **Ghép cặp chéo nguồn quét cả cửa sổ 60 giây.** Backend ghép MỌI số đo `primary` với MỌI số đo
+  `IotGateway` của cùng pin trong 60 giây. Các case phía trên vừa đẩy 15,2 V / 9,5 V / 62 °C /
+  −18 °C lên cùng pin đó, nên gửi cặp chéo nguồn ngay sau sẽ ghép nhầm — **đã quan sát được 57
+  cảnh báo SensorMismatch giả**.
+  ⇒ Bộ chạy chờ **65 giây** rồi mới gửi cặp chéo nguồn (`--fast` để bỏ qua, chấp nhận rác).
+
+Ngoài ra API Gateway giới hạn **60 request / 30 giây** cho lời gọi dùng `X-Api-Key`; bộ chạy gộp
+cả đợt vào một batch và tôn trọng `retryAfterSeconds` khi bị 429.
+
+### Ba luật khử trùng KHÁC NHAU — nguồn gốc của mọi ca "chạy xong mà không thấy gì"
+
+| Nhóm | Khoá khử trùng | Cửa sổ | Hệ quả khi chạy lại |
+|---|---|---|---|
+| Cảnh báo theo ngưỡng pin | `(pin, loại)` | **30 phút** | chỉ tạo dòng `Merged`, không có `Open` mới |
+| Cảnh báo ambient | `(site, loại)` — **không phân biệt mức** | **1 giờ** | bị bỏ qua im lặng; đây là lý do case 24/25 phải chạy riêng |
+| Sự cố môi trường | `(site, loại sự cố)` | **KHÔNG có cửa sổ** | còn một sự cố `Open`/`Acknowledged` là mọi lần báo sau đều trả 200 "reused", **vĩnh viễn** |
+
+`make anomaly-verify` in sẵn ba câu SQL tương ứng để dọn. Riêng nhóm thứ ba nên **đóng** sự cố
+(`status = 3 Resolved`) thay vì xoá — đúng nghiệp vụ hơn.
+
+⚠ Site Solar Farm Long An có sẵn hai sự cố mở từ **dữ liệu seed** (`Smoke` và `OverheatHazard`),
+nên hai loại đó không demo được cho tới khi đóng chúng. Ba case 21–23 cố ý dùng ba loại còn trống
+(`GasLeak`, `Flood`, `FireDetected`).
+
+### Điều kiện phải bật trước ở backend
+
+```bash
+# case 13/14 (Tier 2) — hai cột này mặc định NULL ⇒ luật không bao giờ chạy
+docker exec solar-postgres psql -U postgres -d battery_db -c \
+  "UPDATE threshold_configs SET internal_resistance_max_milliohm = 50,
+                                cell_voltage_delta_max_mv = 100 WHERE is_active;"
+```
+
+### 🔴 Case 26 — đọc trước khi chạy
+
+`IotDataIntegrityViolation` là loại cảnh báo **duy nhất có tác dụng phụ không hồi phục được**.
+Backend đặt `IotDevice.Status = Decommissioned`, và `IotApiKeyService.LookupDeviceByRawKeyAsync`
+loại thẳng thiết bị đó khỏi bảng tra khoá (`WHERE ... status <> 4 AND status <> 5`) ⇒ **mọi**
+request sau đó trả **401**, kể cả provision. `IotDeviceAvailabilityService` chỉ đưa
+`Offline → Active`, không bao giờ gỡ `Decommissioned`.
+
+Vì thế case 26:
+- bị **giữ lại** khỏi lượt chạy thường, cần `--include-dangerous` mới chạy;
+- cố ý dùng **`ESP32-SIM-002`** để thiết bị demo chính không bị ảnh hưởng;
+- kèm sẵn lệnh khôi phục (đã kiểm chứng chạy đúng):
+
+```bash
+docker exec solar-postgres psql -U postgres -d battery_db -c \
+  "UPDATE iot_devices SET status = 2, auto_decommissioned_at = NULL,
+                          outlier_incident_count = 0, outlier_window_started_at = NULL
+   WHERE device_code = 'ESP32-SIM-002';"
+```
+
+---
+
+## 12. Biến môi trường
+
+| Biến | Mặc định | Ý nghĩa |
+|---|---|---|
+| `IOT_BASE_URL` | `https://localhost:7200` | gốc backend |
+| `IOT_TLS_VERIFY` | `true` | tắt khi dùng chứng chỉ tự ký |
+| `IOT_CONTRACT_VERSION` | `iot2-production` | `current` cho backend đời cũ |
+| `IOT_API_KEY` | — | key mặc định cho thiết bị chưa khai trong seed |
+| `IOT_MQTT_ENABLED` | `false` | bật đường MQTT-first |
+| `IOT_MQTT_HOST/PORT/TLS/USERNAME/PASSWORD` | — | đường lui khi backend tắt MQTT |
+| `IOT_SEED_FILE` | `config/seed.yaml` | |
+| `IOT_QUEUE_DIR` | `logs/queue` | |
+| `IOT_STATE_DIR` | `logs/state` | tương đương NVS |
+| `IOT_PERSIST_STATE` | `true` | `false` = thiết bị mới tinh mỗi lần chạy |
+| `IOT_OTA_ENABLED` | `true` | |
+| `IOT_LOG_LEVEL` | `INFO` | |
+
+---
+
+## 13. Tạo thiết bị trên backend
 
 ```bash
 export ADMIN_TOKEN=<JWT admin>
-make provision        # in rawApiKey cho mỗi device — copy ngay (1 lần)
+make provision          # đọc seed.yaml → POST /api/v1/admin/iot-devices → in rawApiKey
 ```
 
-### Test
-
-```bash
-make test     # 26/26 PASS
-```
-
----
-
-## Production contract — payload thực tế
-
-### Mode `current` (Sprint 1 legacy — `tasksprint.md` S1-FW-05 + `newiot.md §7.4`)
-
-```http
-POST /api/sensor-readings/batch
-X-Api-Key: iotk_xxx
-Content-Type: application/json
-
-{
-  "items": [{
-    "batteryAssetId": "22222222-2222-2222-2222-222222222201",
-    "time":           "2026-06-12T10:15:30Z",
-    "voltage":        12.94,
-    "current":        -1.05,
-    "temperature":    29.4,
-    "socPercent":     78.5,
-    "cycleCount":     120
-  }]
-}
-```
-
-> Mode này khớp **firmware ESP32 Sprint 1** (`capstone/iot/firmware-esp32/src/core/payload.cpp`).
-> Sprint 3 chuyển sang `iot2-production` mode để có wrapper `DeviceTimestamp`, `BatteryAssetSerial`, `SourceType`, `SensorSourceCode`, `Idempotency-Key`.
-
-### Mode `iot2-production` — KHỚP firmware `buildProductionBatchPayload` (S3-FW-04)
-
-```http
-POST /api/sensor-readings/batch
-X-Api-Key: iotk_xxx
-X-Device-Code: ESP32-SIM-001
-Idempotency-Key: <uuidv4>
-
-{
-  "items": [
-    { "batteryAssetSerial": "BAT-2026-001",
-      "time": "2026-06-12T10:15:30.000Z", "deviceTimestamp": "2026-06-12T10:15:30.000Z",
-      "voltage": 12.94, "current": -1.05, "temperature": 29.4,
-      "socPercent": 78.5, "cycleCount": 120,
-      "sourceType": 1, "sensorSourceCode": "primary",
-      "sohPercent": 94.2, "chargingState": 3 },
-    { "batteryAssetSerial": "BAT-2026-001",
-      "time": "2026-06-12T10:15:30.001Z", "deviceTimestamp": "2026-06-12T10:15:30.000Z",
-      "voltage": 12.99, "current": -1.04, "temperature": 0.0, "socPercent": 0.0, "cycleCount": 0,
-      "sourceType": 2, "sensorSourceCode": "redundant" },
-    { "batteryAssetSerial": "BAT-2026-001",
-      "time": "2026-06-12T10:15:30.002Z", "deviceTimestamp": "2026-06-12T10:15:30.000Z",
-      "voltage": 0.0, "current": 0.0, "temperature": 35.1, "socPercent": 0.0, "cycleCount": 0,
-      "sourceType": 2, "sensorSourceCode": "external-temp" }
-  ]
-}
-```
-
-> ⚠ KHÔNG có wrapper `DeviceTimestamp`/`Readings`. Backend `BatchIngestSensorReadingsCommand`
-> chỉ bind `List<SensorReadingItem> Items` (camelCase). `time` stagger theo ms PER-SOURCE để
-> tránh trùng PK hypertable `(Time, BatteryAssetId)` (backend khuyến nghị ms-resolution;
-> `CrossSourceValidationService` ghép cặp theo cửa sổ 60s nên lệch ms vẫn pair đúng).
-> `deviceTimestamp` giữ nguyên 1 mốc/tick cho clock-skew check (#IoT2-15).
-
-### Ambient (`/api/ambient/readings/batch`)
-
-```json
-{ "items": [{
-    "siteId":             "11111111-1111-1111-1111-111111111111",
-    "time":               "2026-06-12T10:15:30Z",
-    "ambientTemperature": 34.2,
-    "humidity":           72.5,
-    "solarIrradiance":    580.0,
-    "source":             1,
-    "sourceDeviceId":     "ESP32-SIM-001"
-}] }
-```
-
-### Environmental incident (`/api/environmental-incidents`)
-
-```json
-{ "siteId":      "11111111-1111-1111-1111-111111111111",
-  "incidentType": 1,                                       // Smoke=1
-  "severity":     3,                                       // Critical=3
-  "detectedAt":   "2026-06-12T10:15:30Z",
-  "reportedBy":   "ESP32-SIM-001",
-  "notes":        "MQ-2 smoke ADC=3100 vượt threshold 2500" }
-```
-
----
-
-## Audit log — sửa gì so với bản đầu
-
-Sau khi đối chiếu với `backend/docs/api-battery.md`, đã sửa:
-
-1. **Sensor batch contract** — trước gửi nhầm contract Sprint IoT-2 cho backend hôm nay → 400. Tách 2 mode `current` vs `iot2-production`.
-2. **Environmental incident** — sửa `DeviceCode`/`Description`/`SensorReading` → `siteId`+`incidentType`(int)+`severity`(int)+`detectedAt`+`reportedBy`+`notes`.
-3. **Ambient endpoint** — sửa `/api/ambient-readings/batch` → `/api/ambient/readings/batch` (đúng path), field `TemperatureC` → `ambientTemperature`, source string → int.
-4. **ChargingStateEnum** — sửa `Full=4` thành đúng `Float=4`.
-5. **Cross-source timestamp** — pin `time_iso` per tick để BMS + INA226 + DS18B20 có cùng `Time` (yêu cầu §1.6.6).
-6. **6 scenario thiếu** — thêm `rapid_discharge`, `abnormal_charging`, `soh_degradation`, `high_ambient_temp`, `high_humidity`, `high_temp_humidity_combo`, `fire_detected`, `gas_leak` → đủ 13/15 AnomalyType + 4/6 EnvironmentalIncidentType.
-7. **Battery Guid** — thêm `battery_asset_id` field bắt buộc cho `contract=current`; validator báo lỗi sớm nếu thiếu.
-8. **(2026-06-13) Strict Sprint 1 compliance** — sau khi đối chiếu lại `tasksprint.md` Sprint 1 thật kỹ, sửa 6 điểm cho khớp:
-   - Bỏ `sourceDeviceId` khỏi `current` mode `_bms_to_dict`/`_gw_to_dict` (`newiot.md §7.4` legacy không có field này; Sprint 3 production sẽ có equivalent qua `sensorSourceCode`+`sourceType`).
-   - **Gate `_send_ambient`** (Sprint 5 — S5-FW-06) behind `CONTRACT_IOT2` — Sprint 1 chỉ có mock BMS ingest, KHÔNG có SHT31 ambient.
-   - **Gate `_maybe_trigger_environmental`** (Sprint 6 — S6-FW-01/02) behind `CONTRACT_IOT2` — Sprint 1 KHÔNG có MQ-2 smoke / water leak incident.
-   - `seed.yaml`: `ingest_interval_s` 15 → **5** (khớp S1-FW-07 "Loop chính mỗi 5s").
-   - `seed.yaml`: `batch_size_per_battery` 3 → **1** (firmware Sprint 1 gửi 1 reading/pin/batch).
-   - `seed.yaml`: `initial_soc` 78.5/65 → **30/25** cho 2 pin LiFePO4 12V — đưa voltage `OCV(SOC)` vào dải `12.0..13.0V` theo S1-FW-04 spec ("voltage 12.0–13.0V"). Trước đó voltage 13.15-13.31V (ngoài range).
-
-   > Trong mode `iot2-production`, tất cả tính năng Sprint 2–7 vẫn hoạt động (heartbeat, provision, MQTT, ambient, environmental, firmware-check). User có thể tăng `initial_soc` trở lại nếu muốn test high-SOC scenarios.
-
-9. **(2026-06-14) Sprint 2 alignment với firmware ESP32** — sau khi tôi implement Sprint 2 FW (S2-FW-01..04) cho `iot/firmware-esp32/`, sửa simulator để cùng schema với firmware:
-
-   **HTTP route fix (real bug — đã 404 khi chạy với BE thật):**
-   - **`/api/v1/iot-devices/{provision,heartbeat,firmware-check}` → `/api/iot-devices/...`** — backend thực dùng route KHÔNG có `/v1/` (đã verify trong `services/BatteryService/src/.../IotDevicesController.cs:[Route("api/iot-devices")]`). Sửa cả `src/http_client.py`, `README.md`, `guideline.md` (5 reference). Trước đó simulator gửi tới route `/v1/` → backend trả 404 → provision/heartbeat im lặng fail.
-
-   **Heartbeat body schema (khớp `IotDeviceHeartbeatCommand` + firmware Sprint 2):**
-   - **Bỏ `ConnectedSensorCount`** — KHÔNG có trong backend DTO và firmware ESP32 cũng không gửi. Artifact simulator-only, backend silent ignore.
-   - **Bỏ `IpAddress`** — KHÔNG có trong backend DTO và firmware không gửi.
-   - **Thêm `FreeMemoryPercent`** — Sprint 2 review pass thứ 2 thêm vào firmware vì `MemoryUsageMb` luôn = 0 trên board ESP32-S3 N8 (no PSRAM). Backend command có `decimal? FreeMemoryPercent`.
-   - **Đổi `MemoryUsageMb` từ float → int** — backend field là `long?`. System.Text.Json strict-mode reject float cho integer type. Trước đó `round(x, 1)` = float `156.7` → fix sang `int(round(x))` = `157`.
-
-   > Heartbeat body cuối khớp 1:1 với firmware Sprint 2: `FirmwareVersion`, `Temperature`, `MemoryUsageMb` (int), `FreeMemoryPercent`, `SignalStrengthDbm`, `LocalQueueDepth`, `UptimeSeconds`, `DeviceTimestamp`, `Cpu`=null, `DiskFreeMb`=null.
-
-   **Provision flow — design choice khác (chấp nhận):**
-   - Firmware ESP32: provision **1 lần và persist NVS flag `provd=1`** → idempotent skip lần boot sau.
-   - Simulator: provision **mỗi lần start** (không persist state qua restart) — Python process restart = clean state.
-   - Backend handler `DeviceLifecycleHandlers.cs::Handle(ProvisionIotDeviceCommand)` đã verified idempotent (re-provision device Active vẫn trả OK + config) → cả 2 approach đều work với BE.
-
-10. **(2026-06-26) Full parity với firmware ESP32 "complete" (commit `ec68591`)** — sau khi đọc lại TOÀN BỘ `iot/firmware-esp32/src/` (13 module) + verify trực tiếp DTO backend, sửa các điểm lệch giữa simulator và firmware đã hoàn thiện:
-
-    **🔴 Production ingest contract — bug đúng/sai (sẽ bị backend 400):**
-    - Trước: `iot2-production` gửi `{ "DeviceTimestamp": ..., "Readings": [{ PascalCase }] }`.
-    - Backend `BatchIngestSensorReadingsCommand` chỉ bind `List<SensorReadingItem> Items` — KHÔNG có wrapper → `Items` rỗng → 400 "Danh sách readings là bắt buộc". Firmware `core/payload.cpp::buildProductionBatchPayload` gửi `{ "items": [{ camelCase, deviceTimestamp per-item, sourceType, sensorSourceCode, sohPercent?, chargingState?, bmsErrorCode? }] }`.
-    - **Đã viết lại** `_build_ingest_payload`/`_bms_to_dict`/`_gw_to_dict` khớp 1:1 firmware + backend DTO. Gateway (INA226/DS18B20) emit `0.0` cho field không đo (backend Voltage/Current/Temperature non-nullable decimal). Sửa 3 unit test assert contract cũ sai.
-
-    **🟠 MQTT (S4) — khớp `net/mqtt_client.cpp` + `cmd/`:**
-    - Telemetry topic `solar/{siteId}/{dev}/telemetry` (cả batch) → `solar/{dev}/{serial}/telemetry` **per-pin** (firmware `mqttPublishTelemetry` group-by-serial). Broker ACL `solar/%u/+/telemetry`.
-    - Command schema `{action, value}` → `{cmdId, type, params.pollingSeconds|pollingIntervalSeconds}`; ack `{cmdId, status, message}` → `{cmdId, status, error?}` (firmware `cmd_logic.cpp` + `command_handler.cpp`). type case-insensitive + `_`/`-`. Thêm MQTT-first streak threshold=3 + reset khi reconnect (S4-FW-06).
-
-    **🟠 Provision/Heartbeat/OTA-check:**
-    - `_do_provision` giờ parse `CommonResponse.data` → áp dụng `pollingIntervalSeconds`/`heartbeatIntervalSeconds`/`siteId`/`ntpServer` (firmware `provision.cpp`). **siteId backend-assigned override seed** → ambient + environmental incident dùng đúng site.
-    - Heartbeat **HTTP-only** (firmware `heartbeat.cpp::sendOnce` dùng `httpPostJson`, KHÔNG qua MQTT). Trước simulator ưu tiên MQTT.
-    - firmware-check `6h → 1h` (firmware `OTA_CHECK_INTERVAL_MS = 3600000`).
-
-    **🟡 Tính năng mới (firmware có, simulator thiếu):**
-    - **OTA Sprint 7** (`src/ota.py`): `ota_should_update` (so version chuỗi tuyệt đối — `ota_decision.h`) + `OtaRunner` lifecycle `firmware-check → PUT firmware-update-log {Downloading→Installing→Success} → bump version`. `trigger_ota` cmd chạy thật 1 chu kỳ. (Không tải .bin/SHA/rollback partition — cần hardware thật.)
-    - **LED state** Online/Queued/Offline/Provisioning (`led_palette.h`) trên dashboard.
-
-    **⚠ Phát hiện BUG BACKEND (chặn iot2 ingest — KHÔNG phải lỗi simulator):**
-    - Verify trực tiếp với BE dev đang chạy (`:4001`): legacy `current` ingest ✅ persist (sent=1); iot2 provision/heartbeat/firmware-check ✅ 200. NHƯNG iot2 **sensor-readings/batch ingest → 500**:
-      `23505: duplicate key value violates unique constraint "PK_sensor_ingest_idempotency_records"`.
-    - Root cause: `SensorIngestIdempotencyRecord.Id` **không được sinh** → mọi insert dùng `id = 00000000-...-000000000000`. Insert ĐẦU TIÊN ok, mọi insert sau trùng PK Guid.Empty. DB xác nhận có đúng 1 row id=Guid.Empty.
-    - File: `backend/.../CQRS/Handler/SensorReading/BatchIngestSensorReadingsCommandHandler.cs` (~dòng 348) — `new SensorIngestIdempotencyRecord { ... }` thiếu `Id = Guid.NewGuid()` (hoặc cấu hình `ValueGeneratedOnAdd`).
-    - **Firmware thật cũng dính** (luôn gửi `Idempotency-Key` cho ingest). Simulator gửi đúng UUID key + `X-Device-Code` theo contract → đã đúng; queue+backoff xử lý 500 mượt. Cần fix backend ở repo backend (ngoài scope task simulator này).
-
-    > Tóm tắt verify (BE dev `:4001`): provision 200 ✅ · heartbeat 200 ✅ · firmware-check 200 ✅ · legacy ingest persist ✅ · iot2 ingest blocked-by-BE-bug ⚠ · 44/44 unit test ✅.
-
----
-
-## Ràng buộc
-
-- Không implement Energy/CO2/kWh dashboard (ADR-017 / `tasksprint §0`). INA226 chỉ cross-source validation.
-- BMS reading luôn `SourceType=1`, IotGateway luôn `SourceType=2` (rủi ro số 11 trong risk register).
-- Khi demo hội đồng KLTN, chuyển sang firmware ESP32 thật (Sprint S5+) — file này dùng cho S1→S4 + unit/integration test khi không có pin.
+`rawApiKey` backend **chỉ trả một lần** — chép ngay vào `seed.yaml` hoặc `.env`.
+Nhớ cấp scope tổng **15** (xem §8).

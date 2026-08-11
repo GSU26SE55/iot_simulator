@@ -1,79 +1,76 @@
-"""INA226 (V/I redundant) + DS18B20 (external temp) — sourceType=IotGateway (2).
+"""INA226 (V/I dự phòng) + DS18B20 (nhiệt ngoài thân pin) — `sourceType=IotGateway (2)`.
 
-Cross-source validation (NI §7.6, MO §1.6.6): so cặp reading cùng battery cùng phút giữa
-BMS (sourceType=1, primary) và IotGateway (sourceType=2, redundant/external-temp):
-  - |V_bms − V_iot| > 0.5V → SensorMismatch (Warning)
-  - |T_bms − T_iot| > 5°C  → SensorMismatch (Warning)
+Mirror `mock_bms.cpp::mockGenerateMultiSource` (đường `USE_MOCK_BMS=1`) — đúng chế độ mà simulator
+mô phỏng.
 
-KHI scenario=sensor_mismatch → INA226/DS18B20 cố tình lệch BMS lớn hơn ngưỡng trên.
+Cross-source validation (NI §7.6, MO §1.6.6): backend ghép cặp reading CÙNG pin, CÙNG khung thời
+gian nhưng KHÁC `sourceType` rồi so:
+    |V_bms − V_iot| > 0.5V  → SensorMismatch (Warning)
+    |T_bms − T_iot| > 5°C   → SensorMismatch (Warning)
+Scenario `sensor_mismatch` cố ý đẩy lệch vượt hai ngưỡng đó.
 
-LƯU Ý: `time_iso` được PIN từ caller (cùng tick với BMS reading) để cross-source pair theo đúng phút.
+⚠ TRƯỜNG KHÔNG ĐO ĐƯỢC THÌ **SAO CHÉP TỪ BMS**, KHÔNG GỬI 0.0.
+Đây là điểm phải hết sức cẩn thận. Backend đếm outlier theo dải vật lý — `voltage ∈ (0, 1000]` —
+và **>50 outlier/giờ thì tự chuyển thiết bị sang `Decommissioned`**, mọi request sau trả 409
+(audit `iot-backend-contract-gaps.md` #5). DS18B20 chỉ đo nhiệt; nếu gửi `voltage: 0.0` thì với
+chu kỳ 5s là 720 reading/giờ → thiết bị bị khoá chỉ sau vài phút chạy.
+`mockGenerateMultiSource` của firmware sao chép giá trị BMS cho đúng lý do này; bản simulator cũ
+gửi 0.0 nên đang dính đúng cái bẫy đó.
 """
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass
 
-from ..bms import BmsReading
 from ..config import SensorDrift
+from ..payload import (SOURCE_CODE_EXTERNAL_TEMP, SOURCE_CODE_REDUNDANT,
+                       SOURCE_TYPE_EXTERNAL_TEMP, SOURCE_TYPE_REDUNDANT,
+                       SensorReading)
+
+# Ngưỡng cross-source của backend — scenario `sensor_mismatch` phải vượt hẳn để chắc chắn trigger.
+VOLTAGE_MISMATCH_THRESHOLD_V = 0.5
+TEMPERATURE_MISMATCH_THRESHOLD_C = 5.0
 
 
-@dataclass
-class GatewayReading:
-    battery_serial: str
-    battery_asset_id: str
-    time_iso: str
-    voltage: float | None
-    current: float | None
-    temperature: float | None
-    soc_percent: float | None
-    soh_percent: float | None
-    cycle_count: int | None
-    charging_state: int | None
-    bms_error_code: str | None
-    source_type: int               # IotGateway = 2
-    sensor_source_code: str        # "redundant" | "external-temp"
-
-
-def make_ina226_reading(bms: BmsReading, drift: SensorDrift, scenario: str) -> GatewayReading:
-    """INA226 đo V/I qua I2C — redundant với BMS. Không biết SOC/SOH/cycle/state."""
+def make_ina226_reading(bms: SensorReading, drift: SensorDrift,
+                        scenario: str) -> SensorReading:
+    """INA226 đo V/I qua I2C — dự phòng cho BMS. KHÔNG biết SOC/SOH/cycle/trạng thái sạc."""
     v_offset = drift.voltage_v + random.uniform(-0.01, 0.01)
     if scenario == "sensor_mismatch":
-        v_offset += 0.8                                 # > 0.5V threshold
-    return GatewayReading(
-        battery_serial=bms.battery_serial,
+        v_offset += 0.8                                  # > ngưỡng 0.5V
+    return SensorReading(
         battery_asset_id=bms.battery_asset_id,
-        time_iso=bms.time_iso,                          # cùng tick với BMS
+        serial=bms.serial,
         voltage=round(bms.voltage + v_offset, 3),
         current=round(bms.current + random.uniform(-0.05, 0.05), 3),
-        temperature=None,
-        soc_percent=None,
-        soh_percent=None,
-        cycle_count=None,
-        charging_state=None,
-        bms_error_code=None,
-        source_type=2,
-        sensor_source_code="redundant",
+        temperature=bms.temperature,     # INA226 không đo nhiệt → sao chép BMS (xem ghi chú đầu file)
+        soc_percent=bms.soc_percent,     # không đo SOC → sao chép BMS
+        cycle_count=bms.cycle_count,
+        sensor_source_code=SOURCE_CODE_REDUNDANT,
+        source_type=SOURCE_TYPE_REDUNDANT,
+        # Cảm biến ngoài KHÔNG biết SOH / trạng thái sạc / mã lỗi → không gửi 3 trường đó.
+        has_soh=False,
+        has_charging_state=False,
+        has_bms_error=False,
     )
 
 
-def make_ds18b20_reading(bms: BmsReading, drift: SensorDrift, scenario: str) -> GatewayReading:
-    """DS18B20 đo nhiệt thân pin — external-temp."""
+def make_ds18b20_reading(bms: SensorReading, drift: SensorDrift,
+                         scenario: str) -> SensorReading:
+    """DS18B20 đo nhiệt thân pin (1-Wire) — `external-temp`."""
     t_offset = drift.temperature_c + random.uniform(-0.3, 0.3)
     if scenario == "sensor_mismatch":
-        t_offset += 6.5                                 # > 5°C threshold
-    return GatewayReading(
-        battery_serial=bms.battery_serial,
+        t_offset += 6.5                                  # > ngưỡng 5°C
+    return SensorReading(
         battery_asset_id=bms.battery_asset_id,
-        time_iso=bms.time_iso,
-        voltage=None,
-        current=None,
+        serial=bms.serial,
+        voltage=bms.voltage,             # không đo điện → sao chép BMS (xem ghi chú đầu file)
+        current=bms.current,
         temperature=round(bms.temperature + t_offset, 2),
-        soc_percent=None,
-        soh_percent=None,
-        cycle_count=None,
-        charging_state=None,
-        bms_error_code=None,
-        source_type=2,
-        sensor_source_code="external-temp",
+        soc_percent=bms.soc_percent,
+        cycle_count=bms.cycle_count,
+        sensor_source_code=SOURCE_CODE_EXTERNAL_TEMP,
+        source_type=SOURCE_TYPE_EXTERNAL_TEMP,
+        has_soh=False,
+        has_charging_state=False,
+        has_bms_error=False,
     )

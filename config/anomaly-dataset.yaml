@@ -1,0 +1,472 @@
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# BỘ DỮ LIỆU DEMO ANOMALY — mỗi case đẩy đúng số đo cần thiết để backend dựng 1 loại cảnh báo.
+#
+# Chạy:  make anomaly-list          # xem danh sách + điều kiện của từng case
+#        make anomaly-check         # kiểm tra backend đã đủ điều kiện chưa (không gửi gì)
+#        make anomaly               # chạy TẤT CẢ case chạy được
+#        python -m src.anomaly run --case 1,2,5      # chạy vài case
+#
+# ⚠ MỌI NGƯỠNG DƯỚI ĐÂY ĐÃ ĐỐI CHIẾU TRỰC TIẾP với backend đang chạy
+#   (`threshold_configs`, `ambient_threshold_configs`, `AnomalyRules.cs`, biến môi trường của
+#   BatteryService), KHÔNG chép lại từ tài liệu. Bốn chỗ tài liệu ban đầu ghi SAI, đã sửa:
+#
+#     1. Overheat Critical delta: tài liệu ghi +8°C → THỰC TẾ `OverheatCriticalDeltaC = 5`.
+#     2. Ambient: tài liệu ghi warn 40 / crit 45, combo 38+85
+#        → THỰC TẾ warn 38 / crit 42, combo temp ≥ 35 và ẩm ≥ 75.
+#     3. RapidDischarge/AbnormalCharging: tài liệu dùng NMC 48V, nhưng NMC có
+#        `current_max_charge/discharge = NULL` ⇒ KHÔNG BAO GIỜ kích hoạt.
+#        Loại pin DUY NHẤT trong DB có hai ngưỡng đó là **LiFePO4 24V 30Ah (BAT-2026-REAL-001)**
+#        — sạc 30A / xả 100A. Đã đổi sang pin này.
+#     4. Mốc thời gian cố định 2026-08-08: bộ quét anomaly chỉ nhìn lại **20 giây** gần nhất
+#        (`BATTERY_ANOMALY_SCAN_INTERVAL_SECONDS=10`, lookback = 2× tick), và backend từ chối cả
+#        batch nếu `deviceTimestamp` lệch quá 5 phút. Số đo mang mốc cũ sẽ KHÔNG BAO GIỜ được
+#        quét. Bộ chạy vì thế luôn tự đặt mốc thời gian = "vừa xong".
+#
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+
+meta:
+  verified_against: "battery_db · BatteryService (docker) · AnomalyRules.cs"
+  scan_interval_s: 10          # BATTERY_ANOMALY_SCAN_INTERVAL_SECONDS
+  scan_lookback_s: 20          # = 2 × scan_interval  ⇒ số đo cũ hơn 20s KHÔNG được quét
+  alert_dedup_window_min: 30   # AnomalyEngine__DedupWindowMinutes — chạy lại trong 30' sẽ GỘP
+  offline_threshold_min: 10    # AnomalyEngine__OfflineThresholdMinutes
+  cross_source_pairing_window_s: 60
+  clock_skew_max_min: 5        # lệch quá → backend trả 400 cho CẢ batch
+  noise_suppression_count: 5   # ThresholdConfig.NoiseSuppressionCount trong DB
+  # Khoảng chờ giữa hai ĐỢT gửi. Phải > scan_interval để đợt 1 kịp được ghi vào DB trước khi
+  # đợt 2 bị quét — nếu không, cả hai đợt đều ra effectiveCount = 1 và KHÔNG cảnh báo nào nổ.
+  wave_gap_s: 14
+  # Khoảng lặng trước khi gửi cặp chéo nguồn, phải > cross_source_pairing_window_s.
+  cross_source_isolation_s: 65
+
+# Ngưỡng thật trong DB — chỉ để tra cứu khi đọc case, bộ chạy KHÔNG dùng.
+thresholds:
+  LiFePO4-12V-100Ah:           # BAT-2026-001/002/005/008/009
+    voltage: [10.5, 14.6]
+    temperature: [-10, 60]
+    soc: {warning: 20, critical: 10}
+    soh: {warning: 85, critical: 75}
+    current_max_charge: null   # ⇒ KHÔNG demo được AbnormalCharging trên loại này
+    current_max_discharge: null
+    internal_resistance_max_milliohm: null
+    cell_voltage_delta_max_mv: null
+    noise_suppression: {enabled: true, count: 5, window_hours: 24}
+  NMC-48V-200Ah:               # BAT-2026-003/004/006
+    voltage: [42, 54.6]
+    temperature: [-10, 55]
+    soc: {warning: 25, critical: 15}
+    soh: {warning: 85, critical: 75}
+    current_max_charge: null
+    current_max_discharge: null
+    noise_suppression: {enabled: true, count: 5, window_hours: 24}
+  NCA-24V-150Ah:               # BAT-2026-007
+    voltage: [21, 29.2]
+    temperature: [-10, 55]
+    soc: {warning: 25, critical: 15}
+    soh: {warning: 85, critical: 75}
+  LiFePO4-24V-30Ah:            # BAT-2026-REAL-001  ← pin DUY NHẤT có ngưỡng dòng
+    voltage: [20, 29.5]
+    temperature: [-10, 60]
+    soc: {warning: 20, critical: 10}
+    soh: {warning: 80, critical: 70}
+    current_max_charge: 30
+    current_max_discharge: 100
+    noise_suppression: {enabled: true, count: 5, window_hours: 24}
+  ambient:                     # ambient_threshold_configs — cả 2 site giống nhau
+    high_ambient_temp: {warning: 38, critical: 42}
+    high_humidity: {warning: 80, critical: 90}
+    combo: {temp: 35, humidity: 75}
+
+# Luật bỏ qua chống nhiễu (AnomalyDetectionService.ShouldSuppressByNoiseAsync):
+#   · Cảnh báo chỉ nổ khi số lần vi phạm TRONG CỬA SỔ >= noise_suppression.count (mặc định 5).
+#   · Mỗi lần vi phạm được ghi theo `reading.Time` và KHỬ TRÙNG theo mốc đó ⇒ các lần lặp
+#     BẮT BUỘC phải có `time` khác nhau. Bộ chạy tự giãn mốc theo `interval_s`.
+#   · Bỏ qua luật này (nổ ngay từ 1 số đo): Overheat **Critical**, và mọi EnvironmentalIncident.
+defaults:
+  device_code: ESP32-SIM-001   # thiết bị ở Solar Farm Long An — xem ghi chú `site` bên dưới
+  # Số lần vi phạm gửi cho mỗi case. Bộ chạy tự chia thành 2 đợt: 5 lần (đúng ngưỡng chống
+  # nhiễu) rồi chờ `wave_gap_s` và gửi nốt 2 lần — xem `waves_for()` trong src/anomaly.py để
+  # biết vì sao gửi một lượt KHÔNG bao giờ chắc chắn nổ cảnh báo.
+  repeat: 7
+
+# ⚠ #IoT2-18 — thiết bị CHỈ được gửi số đo cho pin CÙNG SITE, sai site backend trả 403 cho cả
+#   batch. ESP32-SIM-001 ở Solar Farm Long An nên chỉ dùng được:
+#     BAT-2026-001, BAT-2026-002 (LiFePO4 12V) · BAT-2026-003, BAT-2026-004 (NMC 48V)
+#     BAT-2026-REAL-001 (LiFePO4 24V)
+
+cases:
+  # ───────────────────────────── Nhiệt độ ─────────────────────────────
+  - id: 1
+    anomaly: Overheat
+    severity: Warning
+    kind: sensor_reading
+    battery: BAT-2026-001
+    title: Nhiệt vượt TemperatureMax nhưng chưa quá +5°C
+    note: 62 > 60 nhưng < 60+5=65 → Warning. Warning KHÔNG được bỏ qua luật chống nhiễu ⇒ cần đủ 5 lần.
+    reading: {voltage: 13.0, current: 5.0, temperature: 62.0, soc_percent: 60, soh_percent: 90,
+              cycle_count: 250, charging_state: 3}
+
+  - id: 2
+    anomaly: Overheat
+    severity: Critical
+    kind: sensor_reading
+    battery: BAT-2026-002
+    title: Nhiệt vượt TemperatureMax + 5°C
+    note: 72 > 65 → Critical. Overheat Critical BỎ QUA luật chống nhiễu ⇒ nổ ngay từ số đo đầu tiên.
+    repeat: 1
+    bypass_noise: true
+    reading: {voltage: 13.0, current: 5.0, temperature: 72.0, soc_percent: 60, soh_percent: 90,
+              cycle_count: 250, charging_state: 3}
+
+  - id: 3
+    anomaly: Undertemp
+    severity: Warning
+    kind: sensor_reading
+    battery: BAT-2026-001
+    title: Nhiệt dưới TemperatureMin (rủi ro lithium plating khi sạc lạnh — NS-25)
+    note: -12 < -10 nhưng > -10-5=-15 → Warning. `charging_state=2` vì plating xảy ra lúc SẠC.
+    reading: {voltage: 13.0, current: 2.0, temperature: -12.0, soc_percent: 60, soh_percent: 90,
+              cycle_count: 250, charging_state: 2}
+
+  - id: 4
+    anomaly: Undertemp
+    severity: Critical
+    kind: sensor_reading
+    battery: BAT-2026-001
+    title: Nhiệt dưới TemperatureMin - 5°C
+    note: -18 < -15 → Critical. Undertemp KHÔNG nằm trong danh sách bỏ qua chống nhiễu ⇒ cần đủ 5 lần.
+    reading: {voltage: 13.0, current: 2.0, temperature: -18.0, soc_percent: 60, soh_percent: 90,
+              cycle_count: 250, charging_state: 2}
+
+  # ───────────────────────────── Điện áp ─────────────────────────────
+  - id: 5
+    anomaly: Overvoltage
+    severity: Critical
+    kind: sensor_reading
+    battery: BAT-2026-001
+    title: Vượt VoltageMax → luôn Critical
+    reading: {voltage: 15.2, current: 8.0, temperature: 30.0, soc_percent: 90, soh_percent: 90,
+              cycle_count: 250, charging_state: 2}
+
+  - id: 6
+    anomaly: Undervoltage
+    severity: Critical
+    kind: sensor_reading
+    battery: BAT-2026-001
+    title: Dưới VoltageMin → luôn Critical
+    note: 9.5 < 10.5. Vẫn > 0 nên KHÔNG bị tính là outlier (outlier là V ≤ 0 hoặc > 1000).
+    reading: {voltage: 9.5, current: -3.0, temperature: 30.0, soc_percent: 40, soh_percent: 90,
+              cycle_count: 250, charging_state: 3}
+
+  # ───────────────────────────── SOC ─────────────────────────────
+  - id: 7
+    anomaly: LowSoc
+    severity: Warning
+    kind: sensor_reading
+    battery: BAT-2026-001
+    title: SOC dưới ngưỡng cảnh báo 20% nhưng còn trên ngưỡng nguy cấp 10%
+    reading: {voltage: 11.5, current: -3.0, temperature: 30.0, soc_percent: 15, soh_percent: 90,
+              cycle_count: 250, charging_state: 3}
+
+  - id: 8
+    anomaly: LowSoc
+    severity: Critical
+    kind: sensor_reading
+    battery: BAT-2026-003
+    title: SOC dưới ngưỡng nguy cấp (NMC 48V → ngưỡng 15%)
+    note: |
+      Pin NMC nên điện áp phải nằm trong 42–54,6V, KHÔNG dùng 11V như tài liệu gốc — 11V sẽ
+      kích thêm Undervoltage Critical và làm lẫn kết quả demo.
+    reading: {voltage: 45.0, current: -3.0, temperature: 30.0, soc_percent: 8, soh_percent: 88,
+              cycle_count: 400, charging_state: 3}
+
+  # ───────────────────────────── Dòng điện ─────────────────────────────
+  - id: 9
+    anomaly: RapidDischarge
+    severity: Critical
+    kind: sensor_reading
+    battery: BAT-2026-REAL-001         # pin DUY NHẤT có current_max_discharge (100A)
+    title: Dòng xả vượt CurrentMaxDischarge (100A)
+    requires: "threshold_configs.current_max_discharge của LiFePO4 24V 30Ah phải khác NULL (hiện = 100)"
+    reading: {voltage: 24.0, current: -130.0, temperature: 35.0, soc_percent: 50, soh_percent: 90,
+              cycle_count: 300, charging_state: 3}
+
+  - id: 10
+    anomaly: AbnormalCharging
+    severity: Critical
+    kind: sensor_reading
+    battery: BAT-2026-REAL-001         # pin DUY NHẤT có current_max_charge (30A)
+    title: Dòng sạc vượt CurrentMaxCharge (30A)
+    requires: "threshold_configs.current_max_charge của LiFePO4 24V 30Ah phải khác NULL (hiện = 30)"
+    reading: {voltage: 28.0, current: 45.0, temperature: 35.0, soc_percent: 40, soh_percent: 90,
+              cycle_count: 300, charging_state: 2}
+
+  # ───────────────────────────── SOH ─────────────────────────────
+  - id: 11
+    anomaly: SohDegradation
+    severity: Warning
+    kind: sensor_reading
+    battery: BAT-2026-001
+    title: SOH dưới ngưỡng cảnh báo 85% nhưng còn trên ngưỡng nguy cấp 75%
+    reading: {voltage: 12.8, current: 1.0, temperature: 32.0, soc_percent: 55, soh_percent: 82,
+              cycle_count: 1500, charging_state: 1}
+
+  - id: 12
+    anomaly: SohDegradation
+    severity: Critical
+    kind: sensor_reading
+    battery: BAT-2026-004
+    title: SOH dưới ngưỡng nguy cấp 75% (gần hết đời)
+    note: BAT-2026-004 là NMC 48V ⇒ điện áp phải trong 42–54,6V.
+    reading: {voltage: 48.5, current: 1.0, temperature: 32.0, soc_percent: 55, soh_percent: 72,
+              cycle_count: 1800, charging_state: 1}
+
+  # ───────────────────────────── Tier 2 ─────────────────────────────
+  - id: 13
+    anomaly: HighInternalResistance
+    severity: Critical
+    kind: sensor_reading
+    battery: BAT-2026-001
+    title: Điện trở nội vượt ngưỡng (Tier 2 — Sprint 5B #105)
+    requires: |
+      threshold_configs.internal_resistance_max_milliohm HIỆN = NULL cho MỌI loại pin ⇒ luật này
+      KHÔNG BAO GIỜ chạy. Bật bằng:
+        docker exec solar-postgres psql -U postgres -d battery_db -c \
+          "UPDATE threshold_configs SET internal_resistance_max_milliohm = 50 WHERE is_active;"
+    note: ⚠ Firmware ESP32 KHÔNG gửi trường này; chỉ backend có nhận. Đây là case chỉ simulator demo được.
+    reading: {voltage: 12.8, current: 2.0, temperature: 30.0, soc_percent: 60, soh_percent: 88,
+              cycle_count: 400, charging_state: 1, internal_resistance_milliohm: 65}
+
+  - id: 14
+    anomaly: CellImbalance
+    severity: Critical
+    kind: sensor_reading
+    battery: BAT-2026-001
+    title: Lệch điện áp giữa cell max và cell min (Tier 2 — Sprint 5B #105)
+    requires: |
+      threshold_configs.cell_voltage_delta_max_mv HIỆN = NULL cho MỌI loại pin ⇒ luật này KHÔNG
+      BAO GIỜ chạy. Bật bằng:
+        docker exec solar-postgres psql -U postgres -d battery_db -c \
+          "UPDATE threshold_configs SET cell_voltage_delta_max_mv = 100 WHERE is_active;"
+    note: ⚠ Firmware ESP32 KHÔNG gửi trường này; chỉ backend có nhận.
+    reading: {voltage: 12.8, current: 2.0, temperature: 30.0, soc_percent: 60, soh_percent: 88,
+              cycle_count: 400, charging_state: 1, cell_voltage_delta_mv: 135}
+
+  # ───────────────────────────── Chéo nguồn ─────────────────────────────
+  - id: 16
+    anomaly: SensorMismatch
+    severity: Warning
+    kind: cross_source
+    battery: BAT-2026-001
+    title: BMS và IoT Gateway lệch nhau quá ngưỡng trong cùng cửa sổ 60s
+    note: |
+      Dùng `external-temp` chứ KHÔNG dùng `redundant`: backend cố ý BỎ so sánh nhiệt độ với nguồn
+      `redundant` (INA226 không có cảm biến nhiệt — NS-09 #653). Đặt cả lệch áp 0,6V (> 0,5V) lẫn
+      lệch nhiệt 6,5°C (> 5°C) để chắc chắn kích hoạt.
+      Backend chỉ dựng cảnh báo cho số đo `primary` ⇒ nguồn thứ hai chỉ dùng để ghép cặp.
+    repeat: 1
+    readings:
+      - {source_type: 1, sensor_source_code: primary, voltage: 12.8, current: 3.0,
+         temperature: 30.0, soc_percent: 60, soh_percent: 90, cycle_count: 250, charging_state: 3}
+      - {source_type: 2, sensor_source_code: external-temp, voltage: 13.4, current: 3.0,
+         temperature: 36.5, soc_percent: 60, soh_percent: null, cycle_count: 250}
+
+  # ───────────────────────────── Môi trường (ambient) ─────────────────────────────
+  - id: 17
+    anomaly: HighAmbientTemp
+    severity: Critical
+    kind: ambient
+    title: Nhiệt môi trường vượt ngưỡng nguy cấp 42°C
+    note: 48 > 42 → Critical. Độ ẩm để 55% (< 75) nên KHÔNG kích thêm luật kết hợp.
+    repeat: 1
+    reading: {ambient_temperature: 48.0, humidity: 55.0}
+
+  - id: 18
+    anomaly: HighHumidity
+    severity: Warning
+    kind: ambient
+    title: Độ ẩm vượt ngưỡng cảnh báo 80% nhưng dưới ngưỡng nguy cấp 90%
+    note: Nhiệt để 30°C (< 35) nên KHÔNG kích thêm luật kết hợp.
+    repeat: 1
+    reading: {ambient_temperature: 30.0, humidity: 83.0}
+
+  - id: 19
+    anomaly: HighTempHumidityCombo
+    severity: Critical
+    kind: ambient
+    title: Nóng và ẩm cùng lúc (temp ≥ 35 VÀ ẩm ≥ 75)
+    note: |
+      39°C + 87% sẽ sinh ĐỒNG THỜI BA cảnh báo, không phải một:
+        · HighTempHumidityCombo Critical (39 ≥ 35 và 87 ≥ 75)
+        · HighAmbientTemp Warning        (39 > 38)
+        · HighHumidity   Warning         (87 > 80)
+      Luật kết hợp trong `DetectAmbient` là nhánh ĐỘC LẬP, không phải `else`.
+    repeat: 1
+    reading: {ambient_temperature: 39.0, humidity: 87.0}
+
+  # ───────────────────────────── Không phải số đo ─────────────────────────────
+  - id: 15
+    anomaly: DeviceOffline
+    severity: Warning
+    kind: manual
+    title: Thiết bị ngừng gửi số đo quá ngưỡng ngoại tuyến (10 phút)
+    note: |
+      ⚠ Backend có HAI đường DeviceOffline, và chỉ MỘT đường còn sống:
+        · `IotDeviceOfflineDetectionService` — cấp THIẾT BỊ. Alert gắn `IotDeviceId` (KHÔNG có
+          `BatteryAssetId`), `ThresholdValue` = số phút im lặng, tự đóng lại khi thiết bị gửi
+          lại đủ hai tín hiệu liên tiếp. ĐÂY LÀ ĐƯỜNG THẬT SỰ CHẠY.
+        · `AnomalyRules.DetectOffline` — cấp PIN, theo `BatteryAsset.LastSensorReadingAt`.
+          Hàm này là CODE CHẾT trong đường chạy thật: grep toàn bộ backend cho thấy nó chỉ được
+          gọi từ `BatteryService.UnitTests/Application/AnomalyRulesTests.cs`, KHÔNG có chỗ nào
+          trong `src/` gọi tới. Tài liệu anomaly gốc mô tả theo đường này nên sẽ không bao giờ
+          quan sát được kết quả như mô tả.
+    instructions: |
+      Đây là điều kiện THỜI GIAN, không phải một số đo — không gửi gì được để tạo ra nó.
+      Cách demo:
+        1. Chạy simulator bình thường cho tới khi thấy số đo vào DB:
+             IOT_BASE_URL=http://localhost:4001 python -m src.main --no-dashboard --device ESP32-SIM-001
+        2. Dừng nó (Ctrl-C), hoặc chạy với `--scenario device_offline` (tự dừng sau 60s để mô
+           phỏng mất nguồn; nếu bật MQTT thì broker cũng phát LWT "offline" ngay lập tức).
+        3. Chờ > 10 phút (AnomalyEngine__OfflineThresholdMinutes) rồi kiểm tra:
+             docker exec solar-postgres psql -U postgres -d battery_db -c \
+               "SELECT device_code, status, last_seen_at FROM iot_devices WHERE device_code='ESP32-SIM-001';"
+             docker exec solar-postgres psql -U postgres -d battery_db -c \
+               "SELECT a.detected_at, a.threshold_value, a.actual_value, a.unit, d.device_code
+                FROM alerts a JOIN iot_devices d ON d.id = a.iot_device_id
+                WHERE a.anomaly_type = 7 AND a.detected_at > now() - interval '1 hour';"
+        4. Chạy lại simulator → sau hai tín hiệu liên tiếp, backend tự đưa thiết bị về Active và
+           đóng alert. Không cần can thiệp tay.
+
+  # ═══════════════════ Sự cố môi trường — cảnh báo CẤP SITE (AnomalyType = 14) ═══════════════
+  #
+  # Khác mọi case phía trên: KHÔNG đi qua bộ quét ngưỡng. Alert được tạo NGAY trong handler của
+  # `POST /api/environmental-incidents`, được MIỄN luật chống nhiễu, nên một lần báo là đủ.
+  #
+  # ⚠⚠ KHỬ TRÙNG KHÔNG CÓ CỬA SỔ THỜI GIAN. Chỉ cần tồn tại một sự cố `Open` hoặc `Acknowledged`
+  #    cùng `(siteId, incidentType)` là backend DÙNG LẠI nó và trả 200 "Existing active incident
+  #    reused" — KHÔNG tạo cảnh báo mới, dù sự cố cũ đã một tháng tuổi. Bộ chạy báo trạng thái
+  #    `SKIPPED` khi gặp 200 để không ai đi tìm một cảnh báo không tồn tại.
+  #
+  # ⚠ Site Solar Farm Long An ĐANG có sẵn hai sự cố mở từ dữ liệu seed:
+  #     incidentType=1 (Smoke, Open) và incidentType=5 (OverheatHazard, Acknowledged)
+  #   ⇒ hai loại đó KHÔNG demo được cho tới khi giải quyết chúng. Ba loại dưới đây thì còn trống.
+  #   Xem `python -m src.anomaly verify` để lấy câu SQL giải quyết sự cố cũ.
+
+  - id: 21
+    anomaly: EnvironmentalIncident
+    severity: Critical
+    kind: environmental_incident
+    title: Rò khí — MQ-2 vượt ngưỡng (đường THẬT của firmware)
+    note: |
+      Ánh xạ đúng như firmware: MQ-2 là cảm biến GAS nên báo `GasLeak (3)`, không phải `Smoke (1)`
+      (quyết định NS-24 #664). Simulator sinh được sự cố này bằng scenario `gas_leak`/`smoke`:
+        python -m src.main --no-dashboard --device ESP32-SIM-001 --scenario gas_leak
+      Case này gửi thẳng để demo nhanh, không phải chờ 30 giây sấy cảm biến.
+    incident:
+      incident_type: 3          # EnvironmentalIncidentTypeEnum.GasLeak
+      severity: 3               # AlertSeverityEnum.Critical
+      notes: "MQ-2 raw=3100 > thr=2000 (GPIO1)"
+
+  - id: 22
+    anomaly: EnvironmentalIncident
+    severity: Critical
+    kind: environmental_incident
+    title: Ngập nước — cảm biến rò nước (đường THẬT của firmware)
+    note: |
+      Simulator sinh được bằng scenario `water_leak`. Backend enum là `Flood (4)`.
+    incident:
+      incident_type: 4          # EnvironmentalIncidentTypeEnum.Flood
+      severity: 3
+      notes: "water leak GPIO2"
+
+  - id: 23
+    anomaly: EnvironmentalIncident
+    severity: Critical
+    kind: environmental_incident
+    title: Phát hiện cháy — ⚠ MỞ RỘNG RIÊNG CỦA SIMULATOR
+    note: |
+      Firmware ESP32 hiện KHÔNG có đường báo cháy (chỉ MQ-2→GasLeak và rò nước→Flood). Backend
+      thì có sẵn enum `FireDetected (2)` và luồng cảnh báo của nó rất đáng demo. Đừng dùng case
+      này làm bằng chứng cho tính năng firmware.
+      Simulator sinh được bằng scenario `fire_detected` (MQ-2 vượt ngưỡng ĐỒNG THỜI nhiệt pin ≥ 70°C).
+    incident:
+      incident_type: 2          # EnvironmentalIncidentTypeEnum.FireDetected
+      severity: 3
+      notes: "MQ-2 vượt ngưỡng đồng thời nhiệt pin 90.0°C (kịch bản mô phỏng)"
+
+  # ═══════════════════ Mức nghiêm trọng còn thiếu của nhánh ambient ═══════════════════════════
+  #
+  # ⚠ Backend khử trùng cảnh báo ambient theo `(siteId, anomalyType)` trong 1 giờ và KHÔNG phân
+  #   biệt mức nghiêm trọng (`BatchIngestAmbientReadingsCommandHandler`: `Status == Open &&
+  #   DedupWindowEndUtc > now` → `continue`, không log, không lỗi). Nên case 24 loại trừ case 17,
+  #   case 25 loại trừ case 18: gửi cả hai trong một lượt thì cái sau bị NUỐT IM LẶNG.
+  #   Bộ chạy tự bỏ qua cái có `conflicts_with` và in ra lệnh chạy riêng.
+
+  - id: 24
+    anomaly: HighAmbientTemp
+    severity: Warning
+    kind: ambient
+    conflicts_with: 17
+    title: Nhiệt môi trường vượt ngưỡng cảnh báo 38°C nhưng chưa tới nguy cấp 42°C
+    note: 40 > 38 và < 42 → Warning. Ẩm 55% (< 75) để KHÔNG kích thêm luật kết hợp.
+    repeat: 1
+    reading: {ambient_temperature: 40.0, humidity: 55.0}
+
+  - id: 25
+    anomaly: HighHumidity
+    severity: Critical
+    kind: ambient
+    conflicts_with: 18
+    title: Độ ẩm vượt ngưỡng nguy cấp 90%
+    note: 94 > 90 → Critical. Nhiệt 30°C (< 35) để KHÔNG kích thêm luật kết hợp.
+    repeat: 1
+    reading: {ambient_temperature: 30.0, humidity: 94.0}
+
+  # ═══════════════════ Vi phạm toàn vẹn dữ liệu — CÓ TÁC DỤNG PHỤ NẶNG ═══════════════════════
+
+  - id: 26
+    anomaly: IotDataIntegrityViolation
+    severity: Critical
+    kind: sensor_reading
+    battery: BAT-2026-002
+    device_code: ESP32-SIM-002       # CỐ Ý dùng thiết bị phụ — xem `danger` bên dưới
+    dangerous: true
+    bypass_noise: true               # không đi qua luật chống nhiễu; 1 batch là đủ
+    repeat: 60                       # > 50 outlier/giờ → backend tự vô hiệu hoá thiết bị
+    title: Thiết bị gửi >50 số đo phi vật lý trong 1 giờ → bị tự động vô hiệu hoá
+    danger: |
+      🔴 CASE NÀY LÀM HỎNG THIẾT BỊ, KHÔNG TỰ HỒI PHỤC.
+      Backend đặt `IotDevice.Status = Decommissioned`, và `IotApiKeyService.LookupDeviceByRawKeyAsync`
+      LOẠI THẲNG thiết bị Decommissioned khỏi bảng tra khoá ⇒ MỌI request sau đó trả **401**
+      (không phải 409): provision, heartbeat, ingest, ambient, sự cố — tất cả.
+      `IotDeviceAvailabilityService` chỉ đưa Offline → Active, KHÔNG bao giờ gỡ Decommissioned.
+      Vì thế case này dùng ESP32-SIM-002 để thiết bị demo chính (ESP32-SIM-001) không bị ảnh hưởng.
+
+      Khôi phục (bắt buộc chạy sau khi demo xong):
+        docker exec solar-postgres psql -U postgres -d battery_db -c \
+          "UPDATE iot_devices SET status = 2, auto_decommissioned_at = NULL,
+                                  outlier_incident_count = 0, outlier_window_started_at = NULL
+           WHERE device_code = 'ESP32-SIM-002';"
+    note: |
+      `voltage = 2000` vượt trần outlier 1000V nhưng KHÔNG âm — quan trọng: `ValidateAsync` từ chối
+      cả batch với 400 nếu `Voltage < 0`, còn giá trị dương quá lớn thì lọt qua kiểm tra cú pháp và
+      được ĐẾM là outlier ở handler. Đó là con đường duy nhất tới luật này.
+      Kết quả mong đợi: HTTP 201 với `inserted = 0`, `skipped = 60`, và thiết bị chuyển
+      `status = 5 (Decommissioned)` kèm cảnh báo `IotDataIntegrityViolation` mức Critical.
+    reading: {voltage: 2000.0, current: 0.0, temperature: 30.0, soc_percent: 60, soh_percent: 90,
+              cycle_count: 250, charging_state: 1}
+
+  - id: 20
+    anomaly: bms_error_code
+    severity: null
+    kind: sensor_reading
+    battery: BAT-2026-001
+    title: Trường `bmsErrorCode` đi kèm số đo — KHÔNG sinh cảnh báo riêng
+    note: |
+      Đây KHÔNG phải một AnomalyType. `AnomalyRules.Detect` không đọc `bmsErrorCode`; nó chỉ được
+      lưu kèm số đo. Case này để kiểm tra backend NHẬN đúng trường (≤ 64 ký tự), không phải để
+      kích hoạt luật nào. Số đo cố ý nằm hoàn toàn trong ngưỡng → mong đợi 0 cảnh báo.
+    repeat: 1
+    expect_no_anomaly: true
+    reading: {voltage: 13.0, current: 2.0, temperature: 30.0, soc_percent: 60, soh_percent: 90,
+              cycle_count: 250, charging_state: 1, bms_error_code: "OVT-PROTECT"}

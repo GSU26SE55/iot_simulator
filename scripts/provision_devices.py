@@ -28,6 +28,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", default="config/seed.yaml")
     p.add_argument("--insecure", action="store_true")
     p.add_argument("--admin-token", default=os.getenv("ADMIN_TOKEN", ""))
+    p.add_argument("--admin-path", default="/api/admin/iot-devices",
+                   help="route admin tạo device; đổi nếu backend của bạn có tiền tố khác "
+                        "(vd /api/v1/admin/iot-devices)")
     return p.parse_args()
 
 
@@ -58,6 +61,10 @@ def main() -> int:
         "Content-Type": "application/json",
     })
 
+    print("⚠ SCOPE: key cấp cho thiết bị PHẢI có `EnvironmentalIngest` (bitmask 4).")
+    print("  `EdgeDeviceDefault` của backend = SensorIngest|DeviceHeartbeat|FirmwareCheck = 11,")
+    print("  KHÔNG có 4 ⇒ ambient (SHT31) và environmental-incident (MQ-2 / rò nước) sẽ trả 403,")
+    print("  và 403 là lỗi vĩnh viễn nên thiết bị BỎ luôn. Cấp scope tổng = 15.\n")
     print(f"{'DeviceCode':<24} {'Status':<10} RawApiKey (copy ngay — chỉ hiện 1 lần)")
     print("-" * 100)
     for d in devices:
@@ -74,7 +81,7 @@ def main() -> int:
             "notes": "Created by iot-simulator/scripts/provision_devices.py",
         }
         try:
-            r = session.post(f"{args.base_url.rstrip('/')}/api/admin/iot-devices",
+            r = session.post(f"{args.base_url.rstrip('/')}{args.admin_path}",
                              json=body, timeout=15)
         except requests.RequestException as ex:
             print(f"{code:<24} NETERR    {ex}")
