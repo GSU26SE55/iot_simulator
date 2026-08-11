@@ -50,9 +50,13 @@ backend:
   apply_battery_map: true
 
 mqtt:
-  # Bật để chạy đường MQTT-first (S4-FW-04). Không cần điền host/user/pass: `/provision` cấp
-  # đủ 6 trường lúc chạy. Các giá trị dưới chỉ dùng khi backend TẮT MQTT mà bạn vẫn muốn thử
-  # với broker cục bộ.
+  # Bật để chạy đường MQTT-first (S4-FW-04).
+  #
+  # ⚠ Theo THIẾT KẾ (IOT3-42), `/provision` cấp đủ 6 trường lúc chạy và bạn không cần điền gì ở
+  #   đây. NHƯNG đã đo ngày 2026-08-11: **backend đang deploy KHÔNG trả trường `mqtt*` nào**, và
+  #   `iot_devices.mqtt_username` của ESP32-SIM-001/002 vẫn rỗng ⇒ simulator chạy HTTPS-only.
+  #   Muốn demo MQTT ngay thì điền tay các giá trị dưới (broker EMQX ở cổng 11883 cho phép
+  #   anonymous). Chi tiết + cách kiểm chứng: guideline.md §13.1–13.2.
   enabled: false
   host: localhost
   port: 21883                             # solar-mosquitto map 21883:1883

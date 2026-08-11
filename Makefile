@@ -1,7 +1,9 @@
 PY ?= python3
 VENV := .venv
 ACT := . $(VENV)/bin/activate
-MOCK_PORT ?= 4001
+# Cổng cho backend GIẢ. CỐ Ý KHÔNG dùng 4001: ApiGateway thật đã chiếm cổng đó, và
+# `make mock` sẽ chết với "address already in use" ngay trên máy có stack đang chạy.
+MOCK_PORT ?= 4099
 
 .PHONY: help venv install run demo once test lint mock mock-ota provision clean clean-state \
         anomaly anomaly-list anomaly-check anomaly-verify anomaly-dry
@@ -24,11 +26,12 @@ help:
 	@echo "  make clean        xoá venv + hàng đợi + state"
 	@echo ""
 	@echo "  ── demo anomaly (BACKEND=$(BACKEND)) ──"
-	@echo "  make anomaly-list   liệt kê 20 case + điều kiện của từng case"
+	@echo "  make anomaly-list   liệt kê 26 case + điều kiện của từng case"
 	@echo "  make anomaly-check  kiểm tra backend đã đủ điều kiện chưa (KHÔNG gửi gì)"
 	@echo "  make anomaly-dry    in payload thật sẽ gửi, KHÔNG gửi"
-	@echo "  make anomaly        chạy toàn bộ dataset (~90s: 2 đợt + tách cặp chéo nguồn)"
-	@echo "  make anomaly-verify in câu SQL kiểm chứng cảnh báo đã sinh"
+	@echo "  make anomaly        chạy lượt thường (~90s: 2 đợt + tách cặp chéo nguồn)"
+	@echo "  make anomaly-verify in câu SQL kiểm chứng + dọn để demo lại"
+	@echo "  (case 24/25 loại trừ 17/18, case 26 nguy hiểm — bộ chạy tự in cách chạy riêng)"
 
 venv:
 	$(PY) -m venv $(VENV)

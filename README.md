@@ -40,7 +40,7 @@ Lệnh khác:
 
 ```bash
 make once            # gửi một batch rồi thoát (smoke test)
-make test            # 283 unit test
+make test            # 313 unit test
 make clean-state     # xoá state bền vững → thiết bị "mới bóc hộp", provision lại từ đầu
 make mock-ota        # backend giả có offer OTA 1.2.0 (tải thật + xác minh SHA-256 thật)
 ```
@@ -96,6 +96,10 @@ lần chạy sau:   logs/state/<device>.nvs.json ◄─────────�
 Backend quyết định: `pollingIntervalSeconds`, `heartbeatIntervalSeconds`, `siteId`, `ntpServer`,
 6 trường MQTT (`mqttBrokerHost/Port/UseTls/TopicPrefix/Username/Password`), và
 `batteryMappings[]` (serial ↔ unitId ↔ sensorSourceCode).
+
+> ⚠ Đo trên stack đang chạy ngày 2026-08-11: **backend đang deploy chưa trả trường `mqtt*` nào**
+> (mã nguồn đã có IOT3-27/42 nhưng image thì chưa), nên simulator chạy HTTPS-only cho tới khi
+> backend được build lại. Cách demo MQTT ngay: `guideline.md §13`.
 
 Trạng thái bền vững cũng giữ **version firmware đang chạy** (để OTA có ý nghĩa qua các lần chạy)
 và **máy trạng thái OTA** (`otaPend/otaBootN/otaRb/otaBadVer/…`).
@@ -162,9 +166,9 @@ src/
 │   └── fire_watch.py        báo cháy               ← ⚠ RIÊNG của simulator
 └── anomaly.py         bộ chạy dataset anomaly      ← ⚠ RIÊNG của simulator (§11)
 
-config/anomaly-dataset.yaml   20 case demo cảnh báo — xem §11
+config/anomaly-dataset.yaml   26 case demo cảnh báo (phủ 17/17 loại) — xem §11
 tools/mock_backend.py         backend giả, kiểm hợp đồng nghiêm ngặt
-tests/                        283 unit test
+tests/                        313 unit test
 ```
 
 ---
@@ -250,7 +254,7 @@ Nó kiểm: header bắt buộc, định dạng ISO8601, kiểu số nguyên c�
 ## 10. Kiểm thử
 
 ```bash
-make test          # 283 test, chạy < 0,3s, không cần mạng
+make test          # 313 test, chạy < 0,7s, không cần mạng
 ```
 
 | Tệp | Phủ |
@@ -264,7 +268,7 @@ make test          # 283 test, chạy < 0,3s, không cần mạng
 | `test_mqtt_client.py` | topic, trần gói, đếm lỗi xác thực, **chống tự khoá luồng mạng** |
 | `test_http_contract.py` | header, method, route, body — chạy trên client THẬT |
 | `test_features.py` | lệnh downlink, heartbeat, đèn, luật định danh, re-provision |
-| `test_anomaly.py` | dataset anomaly: tính nhất quán, chia đợt, ô thời gian, từng case vượt đúng ngưỡng |
+| `test_anomaly.py` | dataset anomaly: phủ trọn enum, chia đợt, ô thời gian, case xung đột/nguy hiểm, từng case vượt đúng ngưỡng |
 
 Đã kiểm end-to-end: backend giả (0 vi phạm hợp đồng), broker MQTT thật (telemetry per-pin, ack
 downlink, LWT `offline` sau khi `kill -9`), và ngắt backend giữa chừng (hàng đợi lên 6 batch,
@@ -279,29 +283,50 @@ dựng từng loại cảnh báo. Payload đi qua **cùng đường gửi** vớ
 (`payload.py` + `http_client.py`) — không có nhánh riêng cho demo.
 
 ```bash
-make anomaly-list      # 20 case + điều kiện của từng case
+make anomaly-list      # 26 case + điều kiện của từng case
 make anomaly-check     # backend đã đủ điều kiện chưa (KHÔNG gửi gì)
 make anomaly-dry       # in payload thật sẽ gửi
-make anomaly           # chạy toàn bộ (~90 giây)
-make anomaly-verify    # in câu SQL kiểm chứng
+make anomaly           # chạy lượt thường (~90 giây)
+make anomaly-verify    # in câu SQL kiểm chứng + dọn để demo lại
 ```
+
+**Phủ TRỌN 17/17 giá trị `AnomalyTypeEnum` của backend.** Có test bất biến chặn hồi quy:
+`EnumCoverageTest.test_every_backend_anomaly_type_has_a_case` sẽ đỏ nếu backend thêm loại mới mà
+dataset chưa theo kịp.
 
 ### Kết quả đã kiểm trên backend thật
 
-18/18 case gửi được đều nổ đúng loại, đúng mức, đúng giá trị; case 20 đúng như thiết kế là
-**không** sinh cảnh báo nào:
+| Cảnh báo | Mức | Phạm vi | Giá trị | Case |
+|---|---|---|---|---|
+| Overheat | Warning / Critical | BAT‑2026‑001 / ‑002 | 62 °C / 72 °C | 1, 2 |
+| Undertemp | Warning / Critical | BAT‑2026‑001 | −12 °C / −18 °C | 3, 4 |
+| Overvoltage · Undervoltage | Critical | BAT‑2026‑001 | 15,2 V · 9,5 V | 5, 6 |
+| LowSoc | Warning / Critical | BAT‑2026‑001 / ‑003 | 15 % / 8 % | 7, 8 |
+| RapidDischarge · AbnormalCharging | Critical | BAT‑2026‑REAL‑001 | −130 A · 45 A | 9, 10 |
+| SohDegradation | Warning / Critical | BAT‑2026‑001 / ‑004 | 82 % / 72 % | 11, 12 |
+| HighInternalResistance · CellImbalance | Critical | BAT‑2026‑001 | 65 mΩ · 135 mV | 13, 14 |
+| SensorMismatch | Warning | BAT‑2026‑001 | Δ 0,6 V | 16 |
+| HighAmbientTemp | **Warning** / Critical | site | 40 °C / 48 °C | **24**, 17 |
+| HighHumidity | Warning / **Critical** | site | 83 % / 94 % | 18, **25** |
+| HighTempHumidityCombo | Critical | site | 39 °C + 87 % | 19 |
+| **EnvironmentalIncident** | Critical | site | GasLeak · Flood · FireDetected | **21, 22, 23** |
+| **IotDataIntegrityViolation** | Critical | thiết bị | 60 số đo phi vật lý | **26** ⚠ |
+| DeviceOffline | Warning | thiết bị | im lặng > 10 phút | 15 (chạy tay) |
 
-| Cảnh báo | Mức | Pin | Giá trị |
-|---|---|---|---|
-| Overheat | Warning / Critical | BAT‑2026‑001 / ‑002 | 62 °C / 72 °C |
-| Undertemp | Warning / Critical | BAT‑2026‑001 | −12 °C / −18 °C |
-| Overvoltage · Undervoltage | Critical | BAT‑2026‑001 | 15,2 V · 9,5 V |
-| LowSoc | Warning / Critical | BAT‑2026‑001 / ‑003 | 15 % / 8 % |
-| RapidDischarge · AbnormalCharging | Critical | BAT‑2026‑REAL‑001 | −130 A · 45 A |
-| SohDegradation | Warning / Critical | BAT‑2026‑001 / ‑004 | 82 % / 72 % |
-| HighInternalResistance · CellImbalance | Critical | BAT‑2026‑001 | 65 mΩ · 135 mV |
-| HighAmbientTemp · HighHumidity · HighTempHumidityCombo | Critical/Warning/Critical | site | 48 °C · 83 % · 39 °C |
-| SensorMismatch | Warning | BAT‑2026‑001 | 0,6 V |
+Case 20 đúng như thiết kế là **không** sinh cảnh báo nào — nó chỉ kiểm rằng backend nhận đúng
+trường `bmsErrorCode`.
+
+### Bốn case KHÔNG chạy trong lượt thường — và vì sao
+
+| Case | Lý do | Cách chạy |
+|---|---|---|
+| **24** HighAmbientTemp Warning | Backend khử trùng cảnh báo ambient theo `(site, loại)` trong 1 giờ, **không phân biệt mức** — gửi cùng lượt với case 17 thì bị nuốt IM LẶNG | `run --case 24` sau khi dọn cảnh báo cũ |
+| **25** HighHumidity Critical | Cùng lý do, loại trừ case 18 | `run --case 25` |
+| **26** IotDataIntegrityViolation | 🔴 Làm thiết bị bị vô hiệu hoá **vĩnh viễn** | `run --case 26 --include-dangerous` |
+| **15** DeviceOffline | Là điều kiện thời gian, không gửi được | ngừng gửi > 10 phút |
+
+Bộ chạy tự phát hiện và in ra lý do + lệnh chạy riêng, thay vì gửi rồi để bạn đi tìm một cảnh báo
+không bao giờ tồn tại.
 
 ### Bốn chỗ tài liệu gốc ghi SAI so với backend đang chạy — đã sửa trong dataset
 
@@ -337,6 +362,21 @@ make anomaly-verify    # in câu SQL kiểm chứng
 Ngoài ra API Gateway giới hạn **60 request / 30 giây** cho lời gọi dùng `X-Api-Key`; bộ chạy gộp
 cả đợt vào một batch và tôn trọng `retryAfterSeconds` khi bị 429.
 
+### Ba luật khử trùng KHÁC NHAU — nguồn gốc của mọi ca "chạy xong mà không thấy gì"
+
+| Nhóm | Khoá khử trùng | Cửa sổ | Hệ quả khi chạy lại |
+|---|---|---|---|
+| Cảnh báo theo ngưỡng pin | `(pin, loại)` | **30 phút** | chỉ tạo dòng `Merged`, không có `Open` mới |
+| Cảnh báo ambient | `(site, loại)` — **không phân biệt mức** | **1 giờ** | bị bỏ qua im lặng; đây là lý do case 24/25 phải chạy riêng |
+| Sự cố môi trường | `(site, loại sự cố)` | **KHÔNG có cửa sổ** | còn một sự cố `Open`/`Acknowledged` là mọi lần báo sau đều trả 200 "reused", **vĩnh viễn** |
+
+`make anomaly-verify` in sẵn ba câu SQL tương ứng để dọn. Riêng nhóm thứ ba nên **đóng** sự cố
+(`status = 3 Resolved`) thay vì xoá — đúng nghiệp vụ hơn.
+
+⚠ Site Solar Farm Long An có sẵn hai sự cố mở từ **dữ liệu seed** (`Smoke` và `OverheatHazard`),
+nên hai loại đó không demo được cho tới khi đóng chúng. Ba case 21–23 cố ý dùng ba loại còn trống
+(`GasLeak`, `Flood`, `FireDetected`).
+
 ### Điều kiện phải bật trước ở backend
 
 ```bash
@@ -346,9 +386,25 @@ docker exec solar-postgres psql -U postgres -d battery_db -c \
                                 cell_voltage_delta_max_mv = 100 WHERE is_active;"
 ```
 
-⚠ **Chạy lại trong 30 phút sẽ không thấy cảnh báo mới** — backend gộp cảnh báo trùng
-(`AnomalyEngine__DedupWindowMinutes=30`). `make anomaly-verify` in sẵn câu SQL dọn để demo lại
-từ đầu.
+### 🔴 Case 26 — đọc trước khi chạy
+
+`IotDataIntegrityViolation` là loại cảnh báo **duy nhất có tác dụng phụ không hồi phục được**.
+Backend đặt `IotDevice.Status = Decommissioned`, và `IotApiKeyService.LookupDeviceByRawKeyAsync`
+loại thẳng thiết bị đó khỏi bảng tra khoá (`WHERE ... status <> 4 AND status <> 5`) ⇒ **mọi**
+request sau đó trả **401**, kể cả provision. `IotDeviceAvailabilityService` chỉ đưa
+`Offline → Active`, không bao giờ gỡ `Decommissioned`.
+
+Vì thế case 26:
+- bị **giữ lại** khỏi lượt chạy thường, cần `--include-dangerous` mới chạy;
+- cố ý dùng **`ESP32-SIM-002`** để thiết bị demo chính không bị ảnh hưởng;
+- kèm sẵn lệnh khôi phục (đã kiểm chứng chạy đúng):
+
+```bash
+docker exec solar-postgres psql -U postgres -d battery_db -c \
+  "UPDATE iot_devices SET status = 2, auto_decommissioned_at = NULL,
+                          outlier_incident_count = 0, outlier_window_started_at = NULL
+   WHERE device_code = 'ESP32-SIM-002';"
+```
 
 ---
 

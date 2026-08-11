@@ -39,11 +39,16 @@ from .http_client import IotHttpClient
 from .payload import (SOURCE_CODE_PRIMARY, ChargingState, SensorReading, SourceType,
                       build_production_batch_payload)
 from .provision import parse_battery_mappings, parse_provision_response
+from .sensors.environmental import (EnvironmentalIncident, IncidentSeverity, IncidentType)
 from .timeutil import ISO_FORMAT
 
 log = logging.getLogger("iot-sim.anomaly")
 
 DEFAULT_DATASET = "config/anomaly-dataset.yaml"
+
+# Hai loại case tạo cảnh báo NGAY trong handler của endpoint, không qua bộ quét ngưỡng định kỳ
+# ⇒ không cần chia đợt chống nhiễu, và không gắn với một viên pin nào.
+SINGLE_SHOT_KINDS = {"ambient", "environmental_incident"}
 
 # `AnomalyTypeEnum` của backend — dùng cho câu SQL kiểm chứng.
 ANOMALY_TYPE_IDS = {
@@ -210,6 +215,8 @@ class AnomalyRunner:
                 return result
             if kind == "ambient":
                 return self._run_ambient(case, result)
+            if kind == "environmental_incident":
+                return self._run_incident(case, result)
             return self._run_readings(case, result, cross_source=(kind == "cross_source"))
         except Exception as ex:                       # noqa: BLE001
             result.status = "FAIL"
@@ -398,6 +405,66 @@ class AnomalyRunner:
         result.inserted = len(items)
         return result
 
+    def _run_incident(self, case: dict, result: CaseResult) -> CaseResult:
+        """`POST /api/environmental-incidents` — cảnh báo CẤP SITE (`AnomalyType = 14`).
+
+        Khác mọi case còn lại ở ba điểm, và cả ba đều quyết định cách đọc kết quả:
+
+          1. **Không đi qua bộ quét ngưỡng.** Alert được tạo NGAY trong handler của endpoint, nên
+             không cần chờ 10 giây và cũng không cần chia đợt.
+          2. **Được miễn luật chống nhiễu** (`AnomalyDetectionService`) — một lần báo là đủ.
+          3. **Khử trùng theo `(site, incidentType)` KHÔNG CÓ CỬA SỔ THỜI GIAN.** Chỉ cần tồn tại
+             một sự cố `Open` hoặc `Acknowledged` cùng cặp đó là backend **dùng lại** nó và trả
+             **200 "Existing active incident reused"** — KHÔNG tạo alert mới, dù đã một tháng.
+             Vì thế bộ chạy phân biệt rõ 201 (tạo mới) với 200 (dùng lại) thay vì báo "thành công"
+             chung chung: 200 ở đây nghĩa là **demo không sinh cảnh báo nào**.
+        """
+        device_code = str(case.get("device_code") or self.defaults.get("device_code"))
+        info = self.provision(device_code)
+        site_id = info["site_id"]
+        if not site_id:
+            result.status = "FAIL"
+            result.detail = "provision không trả siteId — không gửi được sự cố"
+            return result
+
+        spec = case.get("incident") or {}
+        incident = EnvironmentalIncident(
+            site_id_guid=site_id,
+            incident_type=int(spec.get("incident_type", IncidentType.GAS_LEAK)),
+            severity=int(spec.get("severity", IncidentSeverity.CRITICAL)),
+            # `DetectedAt` không được vượt quá now + 5 phút; lùi 1 giây cho chắc chắn.
+            detected_at=_iso(datetime.now(timezone.utc) - timedelta(seconds=1)),
+            reported_by=device_code,
+            notes=str(spec.get("notes") or ""),
+        )
+        payload = incident.to_payload()
+
+        if self.dry_run:
+            import json
+            result.status = "DRY"
+            result.sent = 1
+            result.detail = json.dumps(payload, ensure_ascii=False)
+            return result
+
+        client = self.client(device_code)
+        res = self._send(lambda: client.environmental_incident(payload), result, "incident")
+        result.sent = 1
+        if not res.ok:
+            result.status = "FAIL"
+            result.detail = f"HTTP {res.status_code}: {res.body[:200]}"
+            return result
+
+        if res.status_code == 200:
+            # Backend dùng lại sự cố đang mở ⇒ KHÔNG có alert mới. Báo rõ, đừng để người demo
+            # tưởng đã xong rồi đi tìm cảnh báo không tồn tại.
+            result.status = "SKIPPED"
+            result.detail = ("backend DÙNG LẠI sự cố đang mở cùng (site, loại) — không tạo cảnh "
+                            "báo mới. Giải quyết sự cố cũ rồi chạy lại: xem `anomaly verify`")
+            return result
+
+        result.inserted = 1
+        return result
+
 
 # ─────────────────────────────────────── lệnh CLI ───────────────────────────────────────────
 def _load_dataset(path: str) -> dict:
@@ -426,6 +493,21 @@ def cmd_list(dataset: dict) -> int:
         print(f"{c.get('id', ''):>3}  {str(c.get('anomaly', '')):<24} "
               f"{str(c.get('severity') or '-'):<9} {str(c.get('kind') or 'sensor_reading'):<14} "
               f"{str(c.get('battery') or '-'):<18} {c.get('title', '')}")
+    danger = [c for c in cases if c.get("dangerous")]
+    if danger:
+        print("\n🔴 CASE CÓ TÁC DỤNG PHỤ NẶNG (bị giữ lại trừ khi có --include-dangerous):")
+        for c in danger:
+            print(f"  · case {c['id']} ({c['anomaly']}): {c.get('title', '')}")
+            for ln in str(c.get("danger", "")).strip().splitlines():
+                print("      " + ln)
+
+    conflict = [c for c in cases if c.get("conflicts_with")]
+    if conflict:
+        print("\n⊘ CASE LOẠI TRỪ LẪN NHAU (backend khử trùng theo (site, loại), không phân biệt mức):")
+        for c in conflict:
+            print(f"  · case {c['id']} ({c['anomaly']} {c.get('severity')}) ⟷ case "
+                  f"{c['conflicts_with']} — chạy riêng từng cái")
+
     blocked = [c for c in cases if c.get("requires")]
     if blocked:
         print("\n⚠ CASE CẦN CHỈNH BACKEND TRƯỚC:")
@@ -505,6 +587,42 @@ def _new_result(case: dict) -> CaseResult:
                       severity=str(case.get("severity") or "-"), status="OK")
 
 
+def _filter_dangerous(cases: list[dict], include_dangerous: bool) -> tuple[list[dict], list[dict]]:
+    """Tách case có tác dụng phụ NẶNG ra khỏi lượt chạy thường.
+
+    Hiện chỉ có `IotDataIntegrityViolation`: nó làm backend **vô hiệu hoá vĩnh viễn** thiết bị,
+    và sau đó mọi request của thiết bị đó trả 401 vì tra khoá API loại thẳng thiết bị
+    `Decommissioned` (`IotApiKeyService.LookupDeviceByRawKeyAsync`). Không có đường tự hồi phục.
+    Chạy nhầm nó giữa buổi demo là mất luôn thiết bị, nên phải bật tường minh bằng cờ.
+    """
+    if include_dangerous:
+        return cases, []
+    safe = [c for c in cases if not c.get("dangerous")]
+    held = [c for c in cases if c.get("dangerous")]
+    return safe, held
+
+
+def _resolve_conflicts(cases: list[dict]) -> tuple[list[dict], list[tuple[dict, int]]]:
+    """Loại case bị KHỬ TRÙNG bởi một case khác trong cùng lượt chạy.
+
+    Backend khử trùng cảnh báo ambient theo `(site, loại)` — KHÔNG phân biệt mức nghiêm trọng —
+    trong 1 giờ. Nên `HighAmbientTemp Warning` và `HighAmbientTemp Critical` không thể cùng nổ
+    trong một lượt: cái gửi sau bị nuốt IM LẶNG (`hasRecent` → `continue`, không log, không lỗi).
+
+    Thà bỏ qua và nói rõ lý do còn hơn gửi rồi để người demo đi tìm một cảnh báo không bao giờ có.
+    """
+    ids = {int(c.get("id", 0)) for c in cases}
+    kept: list[dict] = []
+    dropped: list[tuple[dict, int]] = []
+    for c in cases:
+        other = c.get("conflicts_with")
+        if other is not None and int(other) in ids:
+            dropped.append((c, int(other)))
+            continue
+        kept.append(c)
+    return kept, dropped
+
+
 def _print_case_header(case: dict) -> None:
     print(f"▶ case {case.get('id')}: {case.get('anomaly')} / {case.get('severity') or '-'} "
           f"— {case.get('title', '')}")
@@ -519,11 +637,15 @@ def _print_case_result(r: CaseResult) -> None:
             print(f"    ⚠ {r.detail or 'có reading bị bỏ — xem message của backend'}")
     elif r.status == "DRY":
         print(f"    payload mẫu: {r.detail[:400]}")
+    elif r.status == "SKIPPED":
+        # KHÔNG dùng dấu ✗: đây không phải lỗi, mà là backend cố ý khử trùng.
+        print(f"    ⊘ {r.detail}")
     else:
         print(f"    ✗ {r.status}: {r.detail}")
 
 
-def cmd_run(runner: AnomalyRunner, dataset: dict, wanted: str | None, fast: bool = False) -> int:
+def cmd_run(runner: AnomalyRunner, dataset: dict, wanted: str | None, fast: bool = False,
+            include_dangerous: bool = False) -> int:
     cases = _select(dataset.get("cases", []) or [], wanted)
     if runner.sim_cfg.backend.contract_version != CONTRACT_IOT2 and not runner.dry_run:
         print("✗ contract_version phải là `iot2-production`.")
@@ -532,6 +654,9 @@ def cmd_run(runner: AnomalyRunner, dataset: dict, wanted: str | None, fast: bool
     meta = dataset.get("meta", {}) or {}
     gap = float(meta.get("wave_gap_s", 14))
     isolation = float(meta.get("cross_source_isolation_s", 65))
+
+    cases, held = _filter_dangerous(cases, include_dangerous)
+    cases, conflicting = _resolve_conflicts(cases)
 
     print(f"Backend  : {runner.sim_cfg.backend.base_url}")
     print(f"Dataset  : {len(cases)} case" + ("  (DRY-RUN — không gửi gì)" if runner.dry_run else ""))
@@ -553,8 +678,10 @@ def cmd_run(runner: AnomalyRunner, dataset: dict, wanted: str | None, fast: bool
     for c in normal:
         r = _new_result(c)
         _print_case_header(c)
-        if (c.get("kind") or "") == "ambient":
-            runner._run_ambient(c, r)
+        # Hai loại này KHÔNG đi qua bộ quét ngưỡng nên không cần chia đợt, và cũng không gắn với
+        # một viên pin cụ thể — bỏ qua luôn bước kiểm quyền theo `battery`.
+        if (c.get("kind") or "") in SINGLE_SHOT_KINDS:
+            runner.run_case_into(c, r)
             plans.append((c, r, None))
         elif runner.precheck(c, r):
             waves = runner.waves_for(c)
@@ -614,10 +741,36 @@ def cmd_run(runner: AnomalyRunner, dataset: dict, wanted: str | None, fast: bool
 
     ok = sum(1 for r in results if r.status in ("OK", "DRY"))
     bad = [r for r in results if r.status in ("FAIL", "BLOCKED")]
+    skipped = [r for r in results if r.status == "SKIPPED"]
     print("═" * 70)
-    print(f"Tổng: {ok} chạy được · {len(bad)} lỗi/bị chặn · {len(manual)} chạy tay")
+    print(f"Tổng: {ok} chạy được · {len(bad)} lỗi/bị chặn · {len(skipped)} bị backend khử trùng "
+          f"· {len(manual)} chạy tay")
     for r in bad:
         print(f"  ✗ case {r.case_id} ({r.anomaly}): {r.detail}")
+    for r in skipped:
+        print(f"  ⊘ case {r.case_id} ({r.anomaly}): {r.detail}")
+
+    if conflicting:
+        print("\n⊘ BỎ QUA vì trùng khoá khử trùng với case khác trong CÙNG lượt chạy:")
+        for c, other in conflicting:
+            print(f"  · case {c['id']} ({c['anomaly']} {c.get('severity')}) trùng "
+                  f"(site, loại) với case {other}")
+        print("  Backend khử trùng cảnh báo ambient theo (site, loại) trong 1 giờ, KHÔNG phân biệt")
+        print("  mức nghiêm trọng — gửi cả hai thì cái sau bị nuốt im lặng. Chạy riêng sau khi")
+        print("  giải quyết cảnh báo cũ:")
+        print("    python -m src.anomaly verify        # lấy câu SQL giải quyết cảnh báo")
+        print(f"    python -m src.anomaly run --case "
+              f"{','.join(str(c['id']) for c, _ in conflicting)}")
+
+    if held:
+        print("\n⚠ GIỮ LẠI case có tác dụng phụ NẶNG (cần bật tường minh):")
+        for c in held:
+            print(f"  · case {c['id']} ({c['anomaly']}): {c.get('title', '')}")
+            for ln in str(c.get("danger", "")).strip().splitlines():
+                print("      " + ln)
+        print(f"  Chạy bằng: python -m src.anomaly run --case "
+              f"{','.join(str(c['id']) for c in held)} --include-dangerous")
+
     if not runner.dry_run and ok:
         wait = int(meta.get("scan_interval_s", 10)) * 2 + 5
         print(f"\nChờ ~{wait}s cho bộ quét chạy đủ, rồi kiểm chứng:")
@@ -660,16 +813,59 @@ def cmd_verify(dataset: dict) -> int:
     print("  SELECT code, title, status, created_at FROM tickets")
     print("  WHERE created_at > now() - interval '10 minutes' ORDER BY created_at DESC;\"\n")
 
-    print("─" * 78)
-    print("⚠ CHẠY LẠI TRONG 30 PHÚT SẼ KHÔNG THẤY CẢNH BÁO MỚI.")
-    print("  Backend gộp cảnh báo trùng `(pin, loại)` trong `AnomalyEngine__DedupWindowMinutes`")
-    print("  (mặc định 30 phút): lần chạy sau chỉ tạo dòng `Merged`, còn ambient và chéo nguồn thì")
-    print("  không tạo dòng nào. Đây là hành vi ĐÚNG của backend, không phải lỗi bộ chạy.")
-    print("\n  Muốn demo lại từ đầu, xoá cảnh báo + bộ đếm breach của phiên demo:\n")
+    print("5) Sự cố môi trường (case 21–23, cảnh báo cấp site):\n")
     print("docker exec solar-postgres psql -U postgres -d battery_db -c \"")
-    print("  DELETE FROM alerts             WHERE detected_at > now() - interval '1 hour';")
-    print("  DELETE FROM noise_breach_events WHERE time       > now() - interval '1 hour';\"\n")
-    print("  ⚠ Câu trên XOÁ THẬT. Chỉ dùng trên môi trường dev/demo.")
+    print("  SELECT i.detected_at,")
+    print("         CASE i.incident_type WHEN 1 THEN 'Smoke' WHEN 2 THEN 'FireDetected'")
+    print("              WHEN 3 THEN 'GasLeak' WHEN 4 THEN 'Flood' WHEN 5 THEN 'OverheatHazard'")
+    print("              WHEN 99 THEN 'Other' END AS loai,")
+    print("         CASE i.status WHEN 1 THEN 'Open' WHEN 2 THEN 'Acknowledged'")
+    print("              WHEN 3 THEN 'Resolved' WHEN 4 THEN 'FalseAlarm' END AS trang_thai,")
+    print("         i.reported_by, s.name AS site")
+    print("  FROM environmental_incidents i JOIN sites s ON s.id = i.site_id")
+    print("  ORDER BY i.detected_at DESC LIMIT 15;\"\n")
+
+    print("6) Thiết bị (case 15 ngoại tuyến · case 26 vi phạm toàn vẹn dữ liệu):\n")
+    print("docker exec solar-postgres psql -U postgres -d battery_db -c \"")
+    print("  SELECT device_code,")
+    print("         CASE status WHEN 1 THEN 'Pending' WHEN 2 THEN 'Active' WHEN 3 THEN 'Offline'")
+    print("              WHEN 4 THEN 'Disabled' WHEN 5 THEN 'Decommissioned' END AS trang_thai,")
+    print("         last_seen_at, outlier_incident_count, auto_decommissioned_at")
+    print("  FROM iot_devices WHERE device_code LIKE 'ESP32-SIM-%';\"\n")
+
+    print("═" * 78)
+    print("DỌN ĐỂ DEMO LẠI — ba luật khử trùng khác nhau, cần ba câu khác nhau")
+    print("═" * 78)
+
+    print("\n(a) Cảnh báo theo NGƯỠNG PIN — gộp `(pin, loại)` trong 30 phút")
+    print("    (`AnomalyEngine__DedupWindowMinutes`). Chạy lại trong cửa sổ đó chỉ tạo dòng")
+    print("    `Merged`, không có cảnh báo `Open` mới.\n")
+    print("docker exec solar-postgres psql -U postgres -d battery_db -c \"")
+    print("  DELETE FROM alerts              WHERE detected_at > now() - interval '1 hour';")
+    print("  DELETE FROM noise_breach_events WHERE time        > now() - interval '1 hour';\"")
+
+    print("\n(b) Cảnh báo AMBIENT — khử trùng `(site, loại)` trong 1 giờ, KHÔNG phân biệt mức.")
+    print("    Đây là lý do case 24/25 không thể chạy cùng lượt với case 17/18.")
+    print("    Câu (a) ở trên đã xoá luôn nhóm này (alerts có `battery_asset_id IS NULL`).")
+
+    print("\n(c) SỰ CỐ MÔI TRƯỜNG — khử trùng `(site, loại)` **KHÔNG có cửa sổ thời gian**.")
+    print("    Còn một sự cố `Open`/`Acknowledged` là mọi lần báo sau đều bị dùng lại (HTTP 200).")
+    print("    Đóng chúng lại thay vì xoá — đóng đúng nghiệp vụ hơn:\n")
+    print("docker exec solar-postgres psql -U postgres -d battery_db -c \"")
+    print("  UPDATE environmental_incidents SET status = 3, resolved_at = now()")
+    print("  WHERE status IN (1, 2);\"")
+    print("\n    ⚠ Site Solar Farm Long An có sẵn hai sự cố mở từ dữ liệu seed")
+    print("      (incident_type = 1 Smoke, và 5 OverheatHazard) — chúng chặn đúng hai loại đó.")
+
+    print("\n(d) KHÔI PHỤC thiết bị bị vô hiệu hoá sau case 26 — BẮT BUỘC nếu đã chạy case đó.")
+    print("    Thiết bị `Decommissioned` bị loại khỏi bảng tra khoá API ⇒ mọi request trả 401,")
+    print("    và không có đường tự hồi phục.\n")
+    print("docker exec solar-postgres psql -U postgres -d battery_db -c \"")
+    print("  UPDATE iot_devices SET status = 2, auto_decommissioned_at = NULL,")
+    print("                         outlier_incident_count = 0, outlier_window_started_at = NULL")
+    print("  WHERE device_code = 'ESP32-SIM-002';\"")
+
+    print("\n⚠ Mọi câu trên tác động THẬT vào DB. Chỉ dùng trên môi trường dev/demo.")
     return 0
 
 
@@ -681,6 +877,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--seed", default=None, help="seed YAML (mặc định config/seed.yaml)")
     p.add_argument("--case", default=None, help="danh sách id, vd 1,2,5")
     p.add_argument("--dry-run", action="store_true", help="in payload thật, KHÔNG gửi")
+    p.add_argument("--include-dangerous", action="store_true",
+                   help="cho phép chạy case có tác dụng phụ NẶNG (vô hiệu hoá thiết bị). "
+                        "Không có cờ này thì chúng bị giữ lại kể cả khi chọn bằng --case")
     p.add_argument("--fast", action="store_true",
                    help="bỏ khoảng chờ tách cặp chéo nguồn — nhanh hơn nhưng sinh cảnh báo "
                         "SensorMismatch giả (xem giải thích lúc chạy)")
@@ -700,7 +899,8 @@ def main(argv: list[str] | None = None) -> int:
     runner = AnomalyRunner(sim_cfg, dataset, dry_run=args.dry_run)
     if args.command == "check":
         return cmd_check(runner, dataset)
-    return cmd_run(runner, dataset, args.case, fast=args.fast)
+    return cmd_run(runner, dataset, args.case, fast=args.fast,
+                   include_dangerous=args.include_dangerous)
 
 
 if __name__ == "__main__":

@@ -65,8 +65,16 @@ class DatasetIntegrityTest(unittest.TestCase):
                 self.assertTrue(c.get("instructions"), f"case {c['id']} thiếu instructions")
             elif kind == "cross_source":
                 self.assertGreaterEqual(len(c.get("readings") or []), 2, f"case {c['id']}")
+            elif kind == "environmental_incident":
+                self.assertTrue(c.get("incident"), f"case {c['id']} thiếu khối `incident`")
             else:
                 self.assertTrue(c.get("reading"), f"case {c['id']} thiếu reading")
+
+    def test_every_kind_is_known_to_the_runner(self):
+        """Kind lạ sẽ rơi vào nhánh `sensor_reading` và hỏng theo kiểu khó hiểu."""
+        known = {"sensor_reading", "cross_source", "ambient", "environmental_incident", "manual"}
+        for c in self.cases:
+            self.assertIn(c.get("kind", "sensor_reading"), known, f"case {c['id']}")
 
     def test_sensor_reading_cases_declare_battery(self):
         for c in self.cases:
@@ -277,10 +285,13 @@ class CaseValuesCrossThresholdTest(unittest.TestCase):
             "BAT-2026-004": self.thr["NMC-48V-200Ah"]["voltage"],
             "BAT-2026-REAL-001": self.thr["LiFePO4-24V-30Ah"]["voltage"],
         }
-        # Case 5/6 CỐ Ý vượt dải điện áp; các case còn lại thì không được.
+        # Case 5/6 CỐ Ý vượt dải điện áp (Overvoltage/Undervoltage); case `dangerous` CỐ Ý gửi
+        # giá trị phi vật lý. Mọi case còn lại phải nằm trong dải của đúng loại pin.
         intentional = {5, 6}
         for c in self.ds["cases"]:
-            if c.get("kind", "sensor_reading") != "sensor_reading" or c["id"] in intentional:
+            if c.get("kind", "sensor_reading") != "sensor_reading":
+                continue
+            if c["id"] in intentional or c.get("dangerous"):
                 continue
             lo, hi = ranges[c["battery"]]
             v = c["reading"]["voltage"]
@@ -317,6 +328,263 @@ class CaseValuesCrossThresholdTest(unittest.TestCase):
         self.assertGreaterEqual(r["soc_percent"], thr["soc"]["warning"])
         self.assertGreaterEqual(r["soh_percent"], thr["soh"]["warning"])
         self.assertLessEqual(len(r["bms_error_code"]), 64)
+
+
+class EnvironmentalIncidentCaseTest(unittest.TestCase):
+    """Case sự cố môi trường (AnomalyType 14) — cảnh báo CẤP SITE, không qua bộ quét ngưỡng."""
+
+    # `EnvironmentalIncidentTypeEnum` của backend.
+    VALID_INCIDENT_TYPES = {1, 2, 3, 4, 5, 99}
+    VALID_SEVERITIES = {1, 2, 3}
+
+    def setUp(self):
+        self.ds = _dataset()
+        self.cases = [c for c in self.ds["cases"] if c.get("kind") == "environmental_incident"]
+
+    def test_at_least_one_case_exists(self):
+        self.assertGreaterEqual(len(self.cases), 1)
+
+    def test_incident_fields_match_backend_enums(self):
+        for c in self.cases:
+            inc = c["incident"]
+            self.assertIn(inc["incident_type"], self.VALID_INCIDENT_TYPES, f"case {c['id']}")
+            self.assertIn(inc["severity"], self.VALID_SEVERITIES, f"case {c['id']}")
+            self.assertLessEqual(len(inc.get("notes") or ""), 1000, f"case {c['id']}")
+
+    def test_incident_types_are_distinct(self):
+        """Trùng loại thì case sau bị backend dùng lại sự cố của case trước ⇒ demo mất một case."""
+        types = [c["incident"]["incident_type"] for c in self.cases]
+        self.assertEqual(len(types), len(set(types)))
+
+    def test_avoids_types_already_open_in_seed_data(self):
+        """Site Long An có sẵn sự cố mở loại 1 (Smoke) và 5 (OverheatHazard) từ dữ liệu seed.
+
+        Dùng lại hai loại đó thì backend trả 200 "reused" và KHÔNG có cảnh báo mới — case coi như
+        chết. Ba loại 2/3/4 mới là loại còn trống.
+        """
+        for c in self.cases:
+            self.assertNotIn(c["incident"]["incident_type"], {1, 5},
+                             f"case {c['id']} dùng loại đã có sự cố mở trong dữ liệu seed")
+
+    def test_case_declares_no_battery(self):
+        """Cảnh báo cấp site — gắn pin vào là sai ngữ nghĩa và bộ chạy cũng không dùng tới."""
+        for c in self.cases:
+            self.assertIsNone(c.get("battery"), f"case {c['id']}")
+
+    def test_runner_builds_payload_matching_backend_dto(self):
+        runner = _runner()
+        runner._provision["ESP32-SIM-001"] = {
+            "site_id": "11111111-1111-1111-1111-111111111111", "serials": [], "polling_s": 10}
+        from src.anomaly import CaseResult
+        case = self.cases[0]
+        r = CaseResult(case_id=case["id"], anomaly="EnvironmentalIncident", severity="Critical",
+                       status="OK")
+        runner._run_incident(case, r)
+        import json
+        payload = json.loads(r.detail)
+        self.assertEqual(set(payload.keys()),
+                         {"siteId", "incidentType", "severity", "reportedBy", "detectedAt", "notes"})
+        self.assertIsInstance(payload["incidentType"], int)
+        self.assertIsInstance(payload["severity"], int)
+        self.assertEqual(payload["reportedBy"], "ESP32-SIM-001")
+        self.assertRegex(payload["detectedAt"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
+    def test_detected_at_is_never_in_the_future(self):
+        """Backend từ chối `DetectedAt > now + 5 phút`; bộ chạy lùi 1 giây cho chắc."""
+        from datetime import datetime, timezone
+        from src.anomaly import CaseResult
+        runner = _runner()
+        runner._provision["ESP32-SIM-001"] = {
+            "site_id": "11111111-1111-1111-1111-111111111111", "serials": [], "polling_s": 10}
+        r = CaseResult(case_id=0, anomaly="x", severity="Critical", status="OK")
+        runner._run_incident(self.cases[0], r)
+        import json
+        stamp = datetime.strptime(json.loads(r.detail)["detectedAt"], "%Y-%m-%dT%H:%M:%SZ")
+        self.assertLess(stamp.replace(tzinfo=timezone.utc), datetime.now(timezone.utc))
+
+
+class ConflictAndDangerTest(unittest.TestCase):
+    """Hai cơ chế bảo vệ người demo khỏi hai kiểu 'im lặng không có gì xảy ra'."""
+
+    def setUp(self):
+        self.ds = _dataset()
+        self.cases = self.ds["cases"]
+        self.by_id = {c["id"]: c for c in self.cases}
+
+    # ── conflicts_with ────────────────────────────────────────────────────────────────────
+    def test_conflicts_point_at_an_existing_case(self):
+        for c in self.cases:
+            if c.get("conflicts_with"):
+                self.assertIn(c["conflicts_with"], self.by_id, f"case {c['id']}")
+
+    def test_conflicting_pair_shares_anomaly_and_kind(self):
+        """Chỉ những case cùng `(site, loại)` mới thật sự khử trùng lẫn nhau."""
+        for c in self.cases:
+            other_id = c.get("conflicts_with")
+            if not other_id:
+                continue
+            other = self.by_id[other_id]
+            self.assertEqual(c["anomaly"], other["anomaly"], f"case {c['id']} ⟷ {other_id}")
+            self.assertEqual(c.get("kind"), other.get("kind"), f"case {c['id']} ⟷ {other_id}")
+
+    def test_conflicting_pair_uses_different_severities(self):
+        """Lý do tồn tại của cặp này là để demo NỐT mức nghiêm trọng còn thiếu."""
+        for c in self.cases:
+            other_id = c.get("conflicts_with")
+            if other_id:
+                self.assertNotEqual(c.get("severity"), self.by_id[other_id].get("severity"))
+
+    def test_resolver_drops_the_conflicting_case_when_both_selected(self):
+        from src.anomaly import _resolve_conflicts
+        kept, dropped = _resolve_conflicts([self.by_id[17], self.by_id[24]])
+        self.assertEqual([c["id"] for c in kept], [17])
+        self.assertEqual([(c["id"], other) for c, other in dropped], [(24, 17)])
+
+    def test_resolver_keeps_the_case_when_run_alone(self):
+        from src.anomaly import _resolve_conflicts
+        kept, dropped = _resolve_conflicts([self.by_id[24]])
+        self.assertEqual([c["id"] for c in kept], [24])
+        self.assertEqual(dropped, [])
+
+    # ── dangerous ─────────────────────────────────────────────────────────────────────────
+    def test_dangerous_case_documents_recovery(self):
+        for c in self.cases:
+            if not c.get("dangerous"):
+                continue
+            danger = str(c.get("danger") or "")
+            self.assertTrue(danger, f"case {c['id']} thiếu khối `danger`")
+            self.assertIn("UPDATE iot_devices", danger,
+                          f"case {c['id']} phải kèm lệnh khôi phục thiết bị")
+            self.assertIn("status = 2", danger, f"case {c['id']}")
+
+    def test_dangerous_case_uses_a_spare_device(self):
+        """KHÔNG được làm hỏng thiết bị demo chính — nó bị khoá 401 vĩnh viễn sau đó."""
+        default_device = self.ds["defaults"]["device_code"]
+        for c in self.cases:
+            if c.get("dangerous"):
+                self.assertNotEqual(c.get("device_code"), default_device, f"case {c['id']}")
+                self.assertTrue(c.get("device_code"), f"case {c['id']} phải chỉ rõ device_code")
+
+    def test_dangerous_case_held_back_by_default(self):
+        from src.anomaly import _filter_dangerous
+        safe, held = _filter_dangerous(self.cases, include_dangerous=False)
+        self.assertTrue(held, "phải có ít nhất một case nguy hiểm bị giữ lại")
+        self.assertTrue(all(not c.get("dangerous") for c in safe))
+        self.assertEqual(len(safe) + len(held), len(self.cases))
+
+    def test_dangerous_case_runs_only_with_explicit_flag(self):
+        from src.anomaly import _filter_dangerous
+        safe, held = _filter_dangerous(self.cases, include_dangerous=True)
+        self.assertEqual(held, [])
+        self.assertEqual(len(safe), len(self.cases))
+
+
+class DataIntegrityCaseTest(unittest.TestCase):
+    """Case 26 — con đường duy nhất tới `IotDataIntegrityViolation`."""
+
+    # Ngưỡng outlier hard-code trong `BatchIngestSensorReadingsCommandHandler`.
+    MAX_VOLTAGE = 1000
+    OUTLIER_THRESHOLD_PER_HOUR = 50
+
+    def setUp(self):
+        self.ds = _dataset()
+        self.case = next(c for c in self.ds["cases"]
+                         if c["anomaly"] == "IotDataIntegrityViolation")
+
+    def test_value_is_an_outlier_by_backend_rules(self):
+        self.assertGreater(self.case["reading"]["voltage"], self.MAX_VOLTAGE)
+
+    def test_value_still_passes_request_validation(self):
+        """`ValidateAsync` từ chối CẢ batch với 400 nếu `Voltage < 0`.
+
+        Giá trị âm không bao giờ tới được bộ đếm outlier — chỉ giá trị dương quá lớn mới lọt qua
+        kiểm tra cú pháp rồi bị handler đếm là outlier. Đây là chi tiết quyết định case chạy được
+        hay không.
+        """
+        r = self.case["reading"]
+        self.assertGreater(r["voltage"], 0)
+        self.assertGreaterEqual(r["cycle_count"], 0)
+        self.assertIn(r["charging_state"], {1, 2, 3, 4, 5})
+
+    def test_repeat_exceeds_hourly_outlier_threshold(self):
+        self.assertGreater(self.case["repeat"], self.OUTLIER_THRESHOLD_PER_HOUR)
+
+    def test_single_wave_because_noise_suppression_does_not_apply(self):
+        """Luật này nằm trong handler ingest, không đi qua bộ chống nhiễu ⇒ chia đợt là vô nghĩa."""
+        self.assertTrue(self.case.get("bypass_noise"))
+        self.assertEqual(_runner().waves_for(self.case), [self.case["repeat"]])
+
+    def test_batch_size_within_backend_limit(self):
+        """Backend từ chối batch > 1000 item."""
+        self.assertLessEqual(self.case["repeat"], 1000)
+
+    def test_millisecond_patch_keeps_timestamps_unique_across_the_batch(self):
+        """60 item cùng một giây — nếu ms không đánh index thì đụng khoá chính và bị đếm là
+        `duplicate` thay vì `outlier`, và luật sẽ không bao giờ kích hoạt."""
+        from src.payload import build_production_batch_payload
+        readings = [build_reading(self.case["reading"], "BAT-X")
+                    for _ in range(self.case["repeat"])]
+        items = build_production_batch_payload(readings, "2026-08-10T10:00:00Z", "dev")["items"]
+        times = [i["time"] for i in items]
+        self.assertEqual(len(set(times)), len(times))
+
+
+class SingleShotRoutingTest(unittest.TestCase):
+    """Ambient và sự cố môi trường KHÔNG gắn với pin ⇒ không được đi qua bước kiểm quyền pin."""
+
+    def test_kinds_declared(self):
+        from src.anomaly import SINGLE_SHOT_KINDS
+        self.assertEqual(SINGLE_SHOT_KINDS, {"ambient", "environmental_incident"})
+
+    def test_single_shot_cases_have_no_battery(self):
+        for c in _dataset()["cases"]:
+            from src.anomaly import SINGLE_SHOT_KINDS
+            if c.get("kind") in SINGLE_SHOT_KINDS:
+                self.assertIsNone(c.get("battery"), f"case {c['id']}")
+
+
+class DeviceOfflineDocTest(unittest.TestCase):
+    """Case 15 phải trỏ vào đường DeviceOffline còn SỐNG, không phải hàm chết."""
+
+    def setUp(self):
+        self.case = next(c for c in _dataset()["cases"] if c["anomaly"] == "DeviceOffline")
+
+    def test_notes_flag_the_dead_code_path(self):
+        note = str(self.case.get("note") or "")
+        self.assertIn("IotDeviceOfflineDetectionService", note)
+        self.assertIn("AnomalyRules.DetectOffline", note)
+        self.assertIn("CODE CHẾT", note)
+
+    def test_instructions_query_the_live_table(self):
+        instructions = str(self.case.get("instructions") or "")
+        self.assertIn("iot_devices", instructions)
+        self.assertIn("iot_device_id", instructions,
+                      "câu SQL phải join theo thiết bị — alert của đường sống KHÔNG có battery_asset_id")
+
+
+class EnumCoverageTest(unittest.TestCase):
+    """Bất biến cuối: dataset phải phủ TOÀN BỘ `AnomalyTypeEnum` của backend."""
+
+    def test_every_backend_anomaly_type_has_a_case(self):
+        covered = {c["anomaly"] for c in _dataset()["cases"]}
+        missing = sorted(set(ANOMALY_TYPE_IDS) - covered)
+        self.assertEqual(missing, [], f"còn thiếu case cho: {missing}")
+
+    def test_no_case_references_an_unknown_anomaly(self):
+        known = set(ANOMALY_TYPE_IDS) | {"bms_error_code"}
+        for c in _dataset()["cases"]:
+            self.assertIn(c["anomaly"], known, f"case {c['id']}")
+
+    def test_both_severities_covered_where_backend_can_emit_both(self):
+        """Loại nào backend sinh được cả Warning lẫn Critical thì dataset phải có đủ hai."""
+        both = {"Overheat", "Undertemp", "LowSoc", "SohDegradation",
+                "HighAmbientTemp", "HighHumidity"}
+        by_anomaly: dict[str, set] = {}
+        for c in _dataset()["cases"]:
+            by_anomaly.setdefault(c["anomaly"], set()).add(c.get("severity"))
+        for name in both:
+            self.assertEqual(by_anomaly.get(name), {"Warning", "Critical"},
+                             f"{name} phải có cả hai mức, đang có {by_anomaly.get(name)}")
 
 
 if __name__ == "__main__":

@@ -310,6 +310,16 @@ cases:
     severity: Warning
     kind: manual
     title: Thiết bị ngừng gửi số đo quá ngưỡng ngoại tuyến (10 phút)
+    note: |
+      ⚠ Backend có HAI đường DeviceOffline, và chỉ MỘT đường còn sống:
+        · `IotDeviceOfflineDetectionService` — cấp THIẾT BỊ. Alert gắn `IotDeviceId` (KHÔNG có
+          `BatteryAssetId`), `ThresholdValue` = số phút im lặng, tự đóng lại khi thiết bị gửi
+          lại đủ hai tín hiệu liên tiếp. ĐÂY LÀ ĐƯỜNG THẬT SỰ CHẠY.
+        · `AnomalyRules.DetectOffline` — cấp PIN, theo `BatteryAsset.LastSensorReadingAt`.
+          Hàm này là CODE CHẾT trong đường chạy thật: grep toàn bộ backend cho thấy nó chỉ được
+          gọi từ `BatteryService.UnitTests/Application/AnomalyRulesTests.cs`, KHÔNG có chỗ nào
+          trong `src/` gọi tới. Tài liệu anomaly gốc mô tả theo đường này nên sẽ không bao giờ
+          quan sát được kết quả như mô tả.
     instructions: |
       Đây là điều kiện THỜI GIAN, không phải một số đo — không gửi gì được để tạo ra nó.
       Cách demo:
@@ -318,8 +328,133 @@ cases:
         2. Dừng nó (Ctrl-C), hoặc chạy với `--scenario device_offline` (tự dừng sau 60s để mô
            phỏng mất nguồn; nếu bật MQTT thì broker cũng phát LWT "offline" ngay lập tức).
         3. Chờ > 10 phút (AnomalyEngine__OfflineThresholdMinutes) rồi kiểm tra:
-             docker exec solar-postgres psql -U postgres -d battery_db \
-               -c "SELECT device_code, status, last_seen_at FROM iot_devices WHERE device_code='ESP32-SIM-001';"
+             docker exec solar-postgres psql -U postgres -d battery_db -c \
+               "SELECT device_code, status, last_seen_at FROM iot_devices WHERE device_code='ESP32-SIM-001';"
+             docker exec solar-postgres psql -U postgres -d battery_db -c \
+               "SELECT a.detected_at, a.threshold_value, a.actual_value, a.unit, d.device_code
+                FROM alerts a JOIN iot_devices d ON d.id = a.iot_device_id
+                WHERE a.anomaly_type = 7 AND a.detected_at > now() - interval '1 hour';"
+        4. Chạy lại simulator → sau hai tín hiệu liên tiếp, backend tự đưa thiết bị về Active và
+           đóng alert. Không cần can thiệp tay.
+
+  # ═══════════════════ Sự cố môi trường — cảnh báo CẤP SITE (AnomalyType = 14) ═══════════════
+  #
+  # Khác mọi case phía trên: KHÔNG đi qua bộ quét ngưỡng. Alert được tạo NGAY trong handler của
+  # `POST /api/environmental-incidents`, được MIỄN luật chống nhiễu, nên một lần báo là đủ.
+  #
+  # ⚠⚠ KHỬ TRÙNG KHÔNG CÓ CỬA SỔ THỜI GIAN. Chỉ cần tồn tại một sự cố `Open` hoặc `Acknowledged`
+  #    cùng `(siteId, incidentType)` là backend DÙNG LẠI nó và trả 200 "Existing active incident
+  #    reused" — KHÔNG tạo cảnh báo mới, dù sự cố cũ đã một tháng tuổi. Bộ chạy báo trạng thái
+  #    `SKIPPED` khi gặp 200 để không ai đi tìm một cảnh báo không tồn tại.
+  #
+  # ⚠ Site Solar Farm Long An ĐANG có sẵn hai sự cố mở từ dữ liệu seed:
+  #     incidentType=1 (Smoke, Open) và incidentType=5 (OverheatHazard, Acknowledged)
+  #   ⇒ hai loại đó KHÔNG demo được cho tới khi giải quyết chúng. Ba loại dưới đây thì còn trống.
+  #   Xem `python -m src.anomaly verify` để lấy câu SQL giải quyết sự cố cũ.
+
+  - id: 21
+    anomaly: EnvironmentalIncident
+    severity: Critical
+    kind: environmental_incident
+    title: Rò khí — MQ-2 vượt ngưỡng (đường THẬT của firmware)
+    note: |
+      Ánh xạ đúng như firmware: MQ-2 là cảm biến GAS nên báo `GasLeak (3)`, không phải `Smoke (1)`
+      (quyết định NS-24 #664). Simulator sinh được sự cố này bằng scenario `gas_leak`/`smoke`:
+        python -m src.main --no-dashboard --device ESP32-SIM-001 --scenario gas_leak
+      Case này gửi thẳng để demo nhanh, không phải chờ 30 giây sấy cảm biến.
+    incident:
+      incident_type: 3          # EnvironmentalIncidentTypeEnum.GasLeak
+      severity: 3               # AlertSeverityEnum.Critical
+      notes: "MQ-2 raw=3100 > thr=2000 (GPIO1)"
+
+  - id: 22
+    anomaly: EnvironmentalIncident
+    severity: Critical
+    kind: environmental_incident
+    title: Ngập nước — cảm biến rò nước (đường THẬT của firmware)
+    note: |
+      Simulator sinh được bằng scenario `water_leak`. Backend enum là `Flood (4)`.
+    incident:
+      incident_type: 4          # EnvironmentalIncidentTypeEnum.Flood
+      severity: 3
+      notes: "water leak GPIO2"
+
+  - id: 23
+    anomaly: EnvironmentalIncident
+    severity: Critical
+    kind: environmental_incident
+    title: Phát hiện cháy — ⚠ MỞ RỘNG RIÊNG CỦA SIMULATOR
+    note: |
+      Firmware ESP32 hiện KHÔNG có đường báo cháy (chỉ MQ-2→GasLeak và rò nước→Flood). Backend
+      thì có sẵn enum `FireDetected (2)` và luồng cảnh báo của nó rất đáng demo. Đừng dùng case
+      này làm bằng chứng cho tính năng firmware.
+      Simulator sinh được bằng scenario `fire_detected` (MQ-2 vượt ngưỡng ĐỒNG THỜI nhiệt pin ≥ 70°C).
+    incident:
+      incident_type: 2          # EnvironmentalIncidentTypeEnum.FireDetected
+      severity: 3
+      notes: "MQ-2 vượt ngưỡng đồng thời nhiệt pin 90.0°C (kịch bản mô phỏng)"
+
+  # ═══════════════════ Mức nghiêm trọng còn thiếu của nhánh ambient ═══════════════════════════
+  #
+  # ⚠ Backend khử trùng cảnh báo ambient theo `(siteId, anomalyType)` trong 1 giờ và KHÔNG phân
+  #   biệt mức nghiêm trọng (`BatchIngestAmbientReadingsCommandHandler`: `Status == Open &&
+  #   DedupWindowEndUtc > now` → `continue`, không log, không lỗi). Nên case 24 loại trừ case 17,
+  #   case 25 loại trừ case 18: gửi cả hai trong một lượt thì cái sau bị NUỐT IM LẶNG.
+  #   Bộ chạy tự bỏ qua cái có `conflicts_with` và in ra lệnh chạy riêng.
+
+  - id: 24
+    anomaly: HighAmbientTemp
+    severity: Warning
+    kind: ambient
+    conflicts_with: 17
+    title: Nhiệt môi trường vượt ngưỡng cảnh báo 38°C nhưng chưa tới nguy cấp 42°C
+    note: 40 > 38 và < 42 → Warning. Ẩm 55% (< 75) để KHÔNG kích thêm luật kết hợp.
+    repeat: 1
+    reading: {ambient_temperature: 40.0, humidity: 55.0}
+
+  - id: 25
+    anomaly: HighHumidity
+    severity: Critical
+    kind: ambient
+    conflicts_with: 18
+    title: Độ ẩm vượt ngưỡng nguy cấp 90%
+    note: 94 > 90 → Critical. Nhiệt 30°C (< 35) để KHÔNG kích thêm luật kết hợp.
+    repeat: 1
+    reading: {ambient_temperature: 30.0, humidity: 94.0}
+
+  # ═══════════════════ Vi phạm toàn vẹn dữ liệu — CÓ TÁC DỤNG PHỤ NẶNG ═══════════════════════
+
+  - id: 26
+    anomaly: IotDataIntegrityViolation
+    severity: Critical
+    kind: sensor_reading
+    battery: BAT-2026-002
+    device_code: ESP32-SIM-002       # CỐ Ý dùng thiết bị phụ — xem `danger` bên dưới
+    dangerous: true
+    bypass_noise: true               # không đi qua luật chống nhiễu; 1 batch là đủ
+    repeat: 60                       # > 50 outlier/giờ → backend tự vô hiệu hoá thiết bị
+    title: Thiết bị gửi >50 số đo phi vật lý trong 1 giờ → bị tự động vô hiệu hoá
+    danger: |
+      🔴 CASE NÀY LÀM HỎNG THIẾT BỊ, KHÔNG TỰ HỒI PHỤC.
+      Backend đặt `IotDevice.Status = Decommissioned`, và `IotApiKeyService.LookupDeviceByRawKeyAsync`
+      LOẠI THẲNG thiết bị Decommissioned khỏi bảng tra khoá ⇒ MỌI request sau đó trả **401**
+      (không phải 409): provision, heartbeat, ingest, ambient, sự cố — tất cả.
+      `IotDeviceAvailabilityService` chỉ đưa Offline → Active, KHÔNG bao giờ gỡ Decommissioned.
+      Vì thế case này dùng ESP32-SIM-002 để thiết bị demo chính (ESP32-SIM-001) không bị ảnh hưởng.
+
+      Khôi phục (bắt buộc chạy sau khi demo xong):
+        docker exec solar-postgres psql -U postgres -d battery_db -c \
+          "UPDATE iot_devices SET status = 2, auto_decommissioned_at = NULL,
+                                  outlier_incident_count = 0, outlier_window_started_at = NULL
+           WHERE device_code = 'ESP32-SIM-002';"
+    note: |
+      `voltage = 2000` vượt trần outlier 1000V nhưng KHÔNG âm — quan trọng: `ValidateAsync` từ chối
+      cả batch với 400 nếu `Voltage < 0`, còn giá trị dương quá lớn thì lọt qua kiểm tra cú pháp và
+      được ĐẾM là outlier ở handler. Đó là con đường duy nhất tới luật này.
+      Kết quả mong đợi: HTTP 201 với `inserted = 0`, `skipped = 60`, và thiết bị chuyển
+      `status = 5 (Decommissioned)` kèm cảnh báo `IotDataIntegrityViolation` mức Critical.
+    reading: {voltage: 2000.0, current: 0.0, temperature: 30.0, soc_percent: 60, soh_percent: 90,
+              cycle_count: 250, charging_state: 1}
 
   - id: 20
     anomaly: bms_error_code
