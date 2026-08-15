@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<title>IoT Simulator — Control Panel</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --border: #262b36; --text: #e6e8ec;
+    --muted: #8a90a0; --accent: #4f8cff; --ok: #35c46a; --bad: #ef4444; --warn: #f5a623;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 -apple-system, "Segoe UI", sans-serif; padding: 24px;
+  }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 12.5px; margin-bottom: 20px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+  input[type=text], input[type=number], select {
+    background: #0c0e13; border: 1px solid var(--border); color: var(--text);
+    padding: 6px 8px; border-radius: 6px; font-size: 13px;
+  }
+  label { color: var(--muted); font-size: 12.5px; margin-right: 4px; }
+  button {
+    background: var(--accent); border: none; color: white; padding: 7px 14px;
+    border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 500;
+  }
+  button:hover { opacity: 0.9; }
+  button.secondary { background: #2a2f3b; }
+  button.danger { background: var(--bad); }
+  #connBar {
+    display: flex; gap: 10px; align-items: center; margin-bottom: 20px;
+    padding: 10px 12px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+  }
+  #dot { width: 9px; height: 9px; border-radius: 50%; background: var(--bad); flex-shrink: 0; }
+  #dot.up { background: var(--ok); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 14px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px;
+  }
+  .card h2 { font-size: 15px; margin: 0 0 2px; display: flex; align-items: center; gap: 8px; }
+  .led { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+  .led.online { background: var(--ok); } .led.offline { background: var(--bad); }
+  .led.other { background: var(--warn); }
+  .meta { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
+  .kv { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 12px; font-size: 12.5px; margin-bottom: 14px; }
+  .kv div span { color: var(--muted); }
+  fieldset { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 10px; }
+  legend { color: var(--muted); font-size: 11.5px; padding: 0 6px; }
+  .toast {
+    position: fixed; bottom: 20px; right: 20px; background: var(--panel);
+    border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px;
+    font-size: 12.5px; max-width: 360px; opacity: 0; transform: translateY(8px);
+    transition: all .25s; pointer-events: none;
+  }
+  .toast.show { opacity: 1; transform: translateY(0); }
+  .toast.ok { border-color: var(--ok); }
+  .toast.bad { border-color: var(--bad); }
+  code { background: #0c0e13; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+</style>
+</head>
+<body>
+
+<h1>IoT Simulator — Control Panel</h1>
+<div class="sub">Chỉnh scenario / polling interval trên thiết bị ĐANG CHẠY — có hiệu lực ngay lập tức, không cần restart.</div>
+
+<div id="connBar">
+  <div id="dot"></div>
+  <span id="connText">đang kết nối…</span>
+  <label style="margin-left:auto">Control server</label>
+  <input type="text" id="baseUrl" value="http://127.0.0.1:8787" style="width:220px">
+  <button class="secondary" onclick="refresh()">Làm mới</button>
+</div>
+
+<div id="grid" class="grid"></div>
+
+<div id="toast" class="toast"></div>
+
+<script>
+const SCENARIOS = [
+  "normal","overheat","overvoltage","undervoltage","low_soc","rapid_discharge",
+  "abnormal_charging","soh_degradation","bms_error","sensor_mismatch",
+  "high_ambient_temp","high_humidity","high_temp_humidity_combo",
+  "gas_leak","smoke","water_leak","fire_detected",
+  "device_offline","clock_skew",
+];
+
+function base() { return document.getElementById('baseUrl').value.replace(/\/$/, ''); }
+
+function toast(msg, ok) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast show ' + (ok ? 'ok' : 'bad');
+  clearTimeout(toast._h);
+  toast._h = setTimeout(() => t.classList.remove('show'), 3200);
+}
+
+async function sendCommand(code, type, params) {
+  try {
+    const res = await fetch(`${base()}/devices/${encodeURIComponent(code)}/command`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type, params }),
+    });
+    const data = await res.json();
+    if (!res.ok) { toast(`${code}: ${data.error || 'lỗi'}`, false); return; }
+    toast(`${code}: ${type} → ok`, true);
+    renderDevice(data.state);
+  } catch (e) {
+    toast(`${code}: không gọi được control server (${e.message})`, false);
+    setConn(false);
+  }
+}
+
+function setInterval_(code) {
+  const v = document.getElementById(`interval-${code}`).value;
+  const n = parseInt(v, 10);
+  if (!Number.isFinite(n) || n < 1 || n > 3600) { toast('pollingSeconds phải trong [1, 3600]', false); return; }
+  sendCommand(code, 'set_interval', { pollingSeconds: n });
+}
+
+function setScenario(code) {
+  const v = document.getElementById(`scenario-${code}`).value;
+  sendCommand(code, 'set_scenario', { scenario: v });
+}
+
+function requestHeartbeat(code) { sendCommand(code, 'request_heartbeat', {}); }
+function triggerOta(code) { sendCommand(code, 'trigger_ota', {}); }
+
+function ledClass(status) {
+  if (status === 'online') return 'online';
+  if (status === 'offline' || status === 'halted') return 'offline';
+  return 'other';
+}
+
+function renderDevice(s) {
+  let el = document.getElementById(`card-${s.device_code}`);
+  if (!el) return; // sẽ được vẽ lại ở refresh() kế tiếp nếu là thiết bị mới
+  el.querySelector('.js-status').textContent = s.status;
+  el.querySelector('.js-led').className = 'led ' + ledClass(s.status);
+  el.querySelector('.js-scenario-val').textContent = s.scenario;
+  el.querySelector('.js-sent').textContent = s.sent_batches;
+  el.querySelector('.js-fail').textContent = s.failed_batches;
+  el.querySelector('.js-queue').textContent = s.queued_batches;
+  el.querySelector('.js-soc').textContent = s.last_soc?.toFixed?.(1) ?? s.last_soc;
+  el.querySelector('.js-v').textContent = s.last_voltage?.toFixed?.(2) ?? s.last_voltage;
+  el.querySelector('.js-t').textContent = s.last_temperature?.toFixed?.(1) ?? s.last_temperature;
+  el.querySelector('.js-cmd').textContent = `${s.cmd_ack_ok}/${s.cmd_received}`;
+}
+
+function deviceCard(s) {
+  const scenarioOptions = SCENARIOS.map(sc =>
+    `<option value="${sc}" ${sc === s.scenario ? 'selected' : ''}>${sc}</option>`).join('');
+  return `
+  <div class="card" id="card-${s.device_code}">
+    <h2><span class="led ${ledClass(s.status)} js-led"></span> ${s.device_code}</h2>
+    <div class="meta">status: <b class="js-status">${s.status}</b> · scenario hiện tại: <b class="js-scenario-val">${s.scenario}</b></div>
+
+    <div class="kv">
+      <div>V: <span class="js-v">${s.last_voltage?.toFixed?.(2) ?? s.last_voltage}</span></div>
+      <div>T°C: <span class="js-t">${s.last_temperature?.toFixed?.(1) ?? s.last_temperature}</span></div>
+      <div>SOC%: <span class="js-soc">${s.last_soc?.toFixed?.(1) ?? s.last_soc}</span></div>
+      <div>Sent/Fail: <span class="js-sent">${s.sent_batches}</span>/<span class="js-fail">${s.failed_batches}</span></div>
+      <div>Queue: <span class="js-queue">${s.queued_batches}</span></div>
+      <div>Cmd ack: <span class="js-cmd">${s.cmd_ack_ok}/${s.cmd_received}</span></div>
+    </div>
+
+    <fieldset>
+      <legend>Scenario (đổi ngay lập tức)</legend>
+      <div class="row">
+        <select id="scenario-${s.device_code}">${scenarioOptions}</select>
+        <button onclick="setScenario('${s.device_code}')">Áp dụng</button>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Polling interval</legend>
+      <div class="row">
+        <input type="number" id="interval-${s.device_code}" min="1" max="3600" value="5" style="width:90px">
+        <label>giây [1–3600]</label>
+        <button onclick="setInterval_('${s.device_code}')">Áp dụng</button>
+      </div>
+    </fieldset>
+
+    <div class="row">
+      <button class="secondary" onclick="requestHeartbeat('${s.device_code}')">Gửi heartbeat ngay</button>
+      <button class="secondary" onclick="triggerOta('${s.device_code}')">Kích hoạt OTA check</button>
+    </div>
+  </div>`;
+}
+
+function setConn(up) {
+  document.getElementById('dot').classList.toggle('up', up);
+  document.getElementById('connText').textContent = up
+    ? 'đã kết nối control server'
+    : 'không kết nối được — kiểm tra simulator có chạy với --control-port không';
+}
+
+async function refresh() {
+  try {
+    const res = await fetch(`${base()}/devices`);
+    if (!res.ok) throw new Error(res.status);
+    const data = await res.json();
+    setConn(true);
+    const grid = document.getElementById('grid');
+    const existingIds = new Set(data.devices.map(d => `card-${d.device_code}`));
+    // xoá card của thiết bị không còn nữa
+    [...grid.children].forEach(c => { if (!existingIds.has(c.id)) c.remove(); });
+    data.devices.forEach(s => {
+      const id = `card-${s.device_code}`;
+      if (document.getElementById(id)) {
+        renderDevice(s);
+      } else {
+        grid.insertAdjacentHTML('beforeend', deviceCard(s));
+      }
+    });
+    if (data.devices.length === 0) {
+      grid.innerHTML = '<div class="meta">Chưa có thiết bị nào (server đang chạy nhưng danh sách rỗng).</div>';
+    }
+  } catch (e) {
+    setConn(false);
+  }
+}
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+
+</body>
+</html>
