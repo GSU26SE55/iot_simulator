@@ -34,6 +34,7 @@ from pathlib import Path
 
 import yaml
 
+from .bms import MockBattery
 from .config import CONTRACT_IOT2, SimulatorConfig, load_config
 from .http_client import IotHttpClient
 from .payload import (SOURCE_CODE_PRIMARY, ChargingState, SensorReading, SourceType,
@@ -290,6 +291,92 @@ class AnomalyRunner:
                              f"{', '.join(info['serials'])}")
             return False
         return True
+
+    # Anomaly của case → scenario tương ứng trong `MockBattery`. Warm-up chạy CHÍNH scenario
+    # đó chứ không phải `normal`: mỗi scenario có một biến drift tăng dần theo `dt_s`, nên số
+    # đo nền bò dần về phía ngưỡng đúng như pin đang hỏng thật. Chạy `normal` rồi nhảy thẳng
+    # sang giá trị lỗi cho ra đường 30°C → 72°C trong 5 giây — phi vật lý, nhìn là biết dựng.
+    #
+    # Anomaly không có scenario tương ứng (Undertemp, CellImbalance, HighInternalResistance…)
+    # rơi về `normal`: thà nền phẳng còn hơn bò theo một hướng sai.
+    _WARMUP_SCENARIOS = {
+        "Overheat": "overheat",
+        "Overvoltage": "overvoltage",
+        "Undervoltage": "undervoltage",
+        "LowSoc": "low_soc",
+        "RapidDischarge": "rapid_discharge",
+        "AbnormalCharging": "abnormal_charging",
+        "SohDegradation": "soh_degradation",
+    }
+
+    def send_warmup(self, case: dict, result: CaseResult, count: int = 12,
+                    interval_s: float = 20.0) -> bool:
+        """Gửi `count` số đo BÌNH THƯỜNG ngay TRƯỚC mốc của case, làm nền cho bằng chứng.
+
+        Số đo của case là hằng số cứng trong dataset — cố ý, vì mỗi case chỉ được đẩy DUY NHẤT
+        một trường ra ngoài ngưỡng, khai thừa là kích nhầm luật khác. Nhưng hệ quả là bảng
+        "bằng chứng cảnh báo" chỉ có một dòng với con số tròn trịa, đọc lên không khác gì dữ
+        liệu bịa: không thấy pin trước đó ra sao, không thấy nó vọt lên hay nhảy đột ngột.
+
+        Ở đây dùng `MockBattery` — chính mô hình mà simulator chạy hằng ngày: OCV nội suy theo
+        SOC, sụt áp qua điện trở nội, sinh nhiệt I²R, dao động sin và nhiễu ngẫu nhiên. Số đo
+        nền vì thế lệch nhau từng dòng đúng như pin thật.
+
+        Quan trọng hơn: warm-up chạy CHÍNH scenario của case (xem `_WARMUP_SCENARIOS`), nên
+        các trị số bò dần về phía ngưỡng thay vì phẳng lì rồi nhảy vọt. Với case Overheat,
+        `_scenario_temp_offset` cộng thêm `dt_s * 0.15` mỗi bước, cho ra đường 30 → 34 → 38 →
+        46 → 53 → 61°C trước khi case đẩy 72°C — đọc lên là một viên pin đang nóng lên, không
+        phải một con số rơi từ trên trời.
+
+        Mốc thời gian LÙI VỀ TRƯỚC mốc của case (`_base_time` cấp cho case một giây riêng), để
+        thứ tự đọc là: bình thường → vượt ngưỡng, đúng chiều diễn biến của một sự cố thật.
+        """
+        device_code = str(case.get("device_code") or self.defaults.get("device_code"))
+        serial = str(case.get("battery") or "")
+        if not serial:
+            return True
+
+        dev = self._device_cfg(device_code)
+        bat_cfg = next((b for b in dev.batteries if b.serial == serial), None)
+        if bat_cfg is None:
+            # Pin không nằm trong seed của thiết bị → bỏ warm-up, case vẫn chạy bình thường.
+            return True
+
+        battery = MockBattery(bat_cfg)
+        scenario = self._WARMUP_SCENARIOS.get(str(case.get("anomaly") or ""), "normal")
+        # Mốc gốc của case; warm-up nằm TRƯỚC nó nên trừ dần theo `interval_s`.
+        case_base = self._base_time(serial)
+
+        readings: list[SensorReading] = []
+        stamps: list[datetime] = []
+        for i in range(count, 0, -1):
+            r = battery.step(dt_s=interval_s, t_global=float(count - i) * interval_s,
+                             scenario=scenario)
+            r.serial = serial
+            r.battery_asset_id = bat_cfg.battery_asset_id or ""
+            readings.append(r)
+            stamps.append(case_base - timedelta(seconds=i * interval_s))
+
+        if self.dry_run:
+            result.detail = (result.detail
+                             or f"warm-up {count} số đo nền (MockBattery, scenario={scenario})")
+            return True
+
+        # Gửi từng mốc một: `build_production_batch_payload` đóng CHUNG một `deviceTimestamp`
+        # cho cả batch, mà warm-up cần các mốc cách nhau `interval_s` để dựng nên đường diễn
+        # biến — gộp một batch thì mọi dòng dồn về cùng một giây và mất hẳn ý nghĩa đó.
+        client = self.client(device_code)
+        ok = True
+        for reading, stamp in zip(readings, stamps):
+            payload = build_production_batch_payload([reading], _iso(stamp), device_code)
+            if payload is None:
+                continue
+            res = client.ingest(payload, str(uuid.uuid4()))
+            if not res.ok:
+                ok = False
+                log.warning("warm-up thất bại HTTP %s — case vẫn chạy tiếp", res.status_code)
+                break
+        return ok
 
     def send_wave(self, case: dict, result: CaseResult, count: int) -> bool:
         """Gửi MỘT đợt gồm `count` lần lặp trong DUY NHẤT một batch. Trả False nếu hỏng.
@@ -560,8 +647,11 @@ def cmd_check(runner: AnomalyRunner, dataset: dict) -> int:
             print(f"  {cid:>3} {anomaly:<24} ✗ thiết bị {code} không provision được")
             ok = False
             continue
-        if kind == "ambient":
-            print(f"  {cid:>3} {anomaly:<24} ✓ gửi được (ambient, siteId có sẵn)")
+        # Ambient và sự cố môi trường là cảnh báo CẤP SITE — không gắn với viên pin nào, nên
+        # KHÔNG áp luật #IoT2-18. Thiếu nhánh này thì `serial` = None và case bị báo "BỊ CHẶN" oan.
+        if kind in SINGLE_SHOT_KINDS:
+            what = "ambient" if kind == "ambient" else "sự cố môi trường"
+            print(f"  {cid:>3} {anomaly:<24} ✓ gửi được ({what}, siteId có sẵn)")
             continue
         if info["serials"] and serial not in info["serials"]:
             print(f"  {cid:>3} {anomaly:<24} ✗ BỊ CHẶN — backend không giao pin {serial} "
@@ -645,7 +735,7 @@ def _print_case_result(r: CaseResult) -> None:
 
 
 def cmd_run(runner: AnomalyRunner, dataset: dict, wanted: str | None, fast: bool = False,
-            include_dangerous: bool = False) -> int:
+            include_dangerous: bool = False, warmup: bool = True) -> int:
     cases = _select(dataset.get("cases", []) or [], wanted)
     if runner.sim_cfg.backend.contract_version != CONTRACT_IOT2 and not runner.dry_run:
         print("✗ contract_version phải là `iot2-production`.")
@@ -684,6 +774,10 @@ def cmd_run(runner: AnomalyRunner, dataset: dict, wanted: str | None, fast: bool
             runner.run_case_into(c, r)
             plans.append((c, r, None))
         elif runner.precheck(c, r):
+            # Nền TRƯỚC số đo gây lỗi: bảng bằng chứng cần thấy pin đang xấu dần, không phải
+            # một con số lỗi đứng trơ trọi. Hỏng warm-up không chặn case — nó chỉ là bối cảnh.
+            if warmup:
+                runner.send_warmup(c, r)
             waves = runner.waves_for(c)
             if runner.send_wave(c, r, waves[0]):
                 plans.append((c, r, waves))
@@ -880,6 +974,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--include-dangerous", action="store_true",
                    help="cho phép chạy case có tác dụng phụ NẶNG (vô hiệu hoá thiết bị). "
                         "Không có cờ này thì chúng bị giữ lại kể cả khi chọn bằng --case")
+    p.add_argument("--no-warmup", action="store_true",
+                   help="bỏ bước gửi số đo nền trước mỗi case. Mặc định CÓ gửi: thiếu nó thì "
+                        "bảng bằng chứng chỉ có đúng một dòng số tròn trịa, không thấy pin xấu "
+                        "dần nên đọc lên không khác gì dữ liệu bịa")
     p.add_argument("--fast", action="store_true",
                    help="bỏ khoảng chờ tách cặp chéo nguồn — nhanh hơn nhưng sinh cảnh báo "
                         "SensorMismatch giả (xem giải thích lúc chạy)")
@@ -900,7 +998,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "check":
         return cmd_check(runner, dataset)
     return cmd_run(runner, dataset, args.case, fast=args.fast,
-                   include_dangerous=args.include_dangerous)
+                   include_dangerous=args.include_dangerous, warmup=not args.no_warmup)
 
 
 if __name__ == "__main__":
