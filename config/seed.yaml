@@ -103,42 +103,15 @@ persist_state: true
 # Giá trị dưới lấy đúng từ `battery_assets` + `threshold_configs` của backend (đối chiếu trực
 # tiếp DB local ngày 2026-08-12 — `battery_asset_id` là GUID THẬT, không phải placeholder).
 battery_catalog:
-  - serial: BAT-2026-001        # LiFePO4 12V 100Ah · Long An · ngưỡng 10,5–14,6V
-    battery_asset_id: 1140f7fe-d5e3-4355-a4f7-63a745183751
+  - serial: BAT-2026-REAL-001   # LiFePO4 24V 30Ah · Long An · ngưỡng 20,00–29,20V
+    battery_asset_id: aaaa0001-0000-4000-8000-000000000024
     unit_id: 1
-    nominal_voltage: 12.8
-    nominal_capacity_ah: 100
+    nominal_voltage: 25.6
+    nominal_capacity_ah: 30
     initial_soc: 60.0
-    initial_soh: 94.2
-    cycle_count: 120
-    chemistry: LiFePO4
-  - serial: BAT-2026-002        # LiFePO4 12V 100Ah · Long An
-    battery_asset_id: b03d7121-7602-42a6-b0a3-4b2bad1ce205
-    unit_id: 2
-    nominal_voltage: 12.8
-    nominal_capacity_ah: 100
-    initial_soc: 55.0
-    initial_soh: 88.0
-    cycle_count: 245
-    chemistry: LiFePO4
-  - serial: BAT-2026-003        # NMC 48V 200Ah · Long An · ngưỡng 42–54,6V
-    battery_asset_id: cf04a874-4aae-49ff-9134-66e7920fabcf
-    unit_id: 3
-    nominal_voltage: 48.0
-    nominal_capacity_ah: 200
-    initial_soc: 55.0
-    initial_soh: 82.0
-    cycle_count: 1850
-    chemistry: NMC
-  - serial: BAT-2026-004        # NMC 48V 200Ah · Long An
-    battery_asset_id: 9e9b3343-0de0-4fab-9029-5fb794921ad6
-    unit_id: 4
-    nominal_voltage: 48.0
-    nominal_capacity_ah: 200
-    initial_soc: 65.0
     initial_soh: 90.0
-    cycle_count: 200
-    chemistry: NMC
+    cycle_count: 300
+    chemistry: LiFePO4
 
 devices:
   # ─── Thiết bị 1: 2 pin LiFePO4 12V, đủ cảm biến — scenario normal ───
@@ -152,23 +125,14 @@ devices:
     #   cũ không còn tồn tại). Tạo lại qua POST /api/admin/iot-devices.
     api_key: iotk_sqXpQ0YuYZUQhETZJEShAdFNCNKAnGa8KDmNIWACHVo
     batteries:
-      - serial: BAT-2026-001
-        battery_asset_id: 40e96665-f83f-400e-8d6f-6d9b6daff954
+      - serial: BAT-2026-REAL-001
+        battery_asset_id: aaaa0001-0000-4000-8000-000000000024
         unit_id: 1
-        nominal_voltage: 12.8
-        nominal_capacity_ah: 100
-        initial_soc: 30.0
-        initial_soh: 94.2
-        cycle_count: 120
-        chemistry: LiFePO4
-      - serial: BAT-2026-002
-        battery_asset_id: 1f2f9af3-1cbf-4613-af57-29c58443e1ba
-        unit_id: 2
-        nominal_voltage: 12.8
-        nominal_capacity_ah: 100
-        initial_soc: 25.0
-        initial_soh: 88.0
-        cycle_count: 245
+        nominal_voltage: 25.6
+        nominal_capacity_ah: 30
+        initial_soc: 60.0
+        initial_soh: 90.0
+        cycle_count: 300
         chemistry: LiFePO4
     sensors:
       ina226: true          # sourceType=IotGateway, sensorSourceCode="redundant"
@@ -190,35 +154,35 @@ devices:
       water_leak_poll_interval_s: 0.5     # WATER_LEAK_POLL_INTERVAL_MS
       water_leak_rearm_cooldown_s: 300    # WATER_LEAK_REARM_COOLDOWN_MS
 
-  # ─── Thiết bị 2: 1 pin NMC 48V 200Ah — scenario low_soc (demo cảnh báo P2) ───
-  - device_code: ESP32-SIM-002
-    site_id_guid: 886564d0-8e8b-4b51-81be-e0c3f895c38f
-    site_label: solar-farm-long-an
-    firmware_version: 1.0.0-sim
-    hardware_revision: ESP32-S3-DevKitC-1-N16R8
-    model: ESP32-WROOM-S3
-    # ⚠ Rotate lại 2026-08-13 — lý do giống ESP32-SIM-001 ở trên.
-    api_key: iotk_BwMOtw4pOg8mIzICSQpHfBqQqQjoHB7CzL2ESUwNOZU
-    batteries:
-      - serial: BAT-2026-003
-        battery_asset_id: 424a4f8d-c7f3-4fed-a6df-8afc202e4870
-        unit_id: 1
-        nominal_voltage: 48.0
-        nominal_capacity_ah: 200
-        initial_soc: 55.0
-        initial_soh: 82.0
-        cycle_count: 1850
-        chemistry: NMC
-    sensors:
-      ina226: true
-      ds18b20: true
-      sht31: false
-      mq2: false
-      water_leak: false
-    scenario: low_soc
-    sensor_drift:
-      voltage_v: 0.08
-      temperature_c: 0.8
+#   # ─── Thiết bị 2: 1 pin NMC 48V 200Ah — scenario low_soc (demo cảnh báo P2) ───
+#   - device_code: ESP32-SIM-002
+#     site_id_guid: 886564d0-8e8b-4b51-81be-e0c3f895c38f
+#     site_label: solar-farm-long-an
+#     firmware_version: 1.0.0-sim
+#     hardware_revision: ESP32-S3-DevKitC-1-N16R8
+#     model: ESP32-WROOM-S3
+#     # ⚠ Rotate lại 2026-08-13 — lý do giống ESP32-SIM-001 ở trên.
+#     api_key: iotk_BwMOtw4pOg8mIzICSQpHfBqQqQjoHB7CzL2ESUwNOZU
+#     batteries:
+#       - serial: BAT-2026-REAL-001
+#         battery_asset_id: aaaa0001-0000-4000-8000-000000000024
+#         unit_id: 1
+#         nominal_voltage: 25.6
+#         nominal_capacity_ah: 30
+#         initial_soc: 60.0
+#         initial_soh: 90.0
+#         cycle_count: 300
+#         chemistry: LiFePO4
+#     sensors:
+#       ina226: true
+#       ds18b20: true
+#       sht31: false
+#       mq2: false
+#       water_leak: false
+#     scenario: low_soc
+#     sensor_drift:
+#       voltage_v: 0.08
+#       temperature_c: 0.8
 
 # ─── Danh sách scenario (đặt ở `scenario:` của thiết bị, hoặc CLI --scenario, hoặc lệnh MQTT
 #     `set_scenario` lúc đang chạy) ───

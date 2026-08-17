@@ -150,7 +150,8 @@ class AnomalyPanel:
 
     # ── /api/run ───────────────────────────────────────────────────────────────────────────
     def run_cases(self, ids: list[int], include_dangerous: bool = False,
-                  dry_run: bool = False) -> dict:
+                  dry_run: bool = False, live: bool = False,
+                  live_interval_s: float = 5.0) -> dict:
         """Chạy các case đã chọn. Giữ nguyên luật hai đợt của CLI: case cần vượt ngưỡng chống
         nhiễu phải gửi đợt 1, CHỜ `wave_gap_s`, rồi gửi đợt 2 — gộp một lượt thì backend đếm
         `effectiveCount = 1` và không cảnh báo nào nổ."""
@@ -184,7 +185,15 @@ class AnomalyPanel:
                 elif runner.precheck(c, r):
                     # Nền trước số đo gây lỗi — xem `send_warmup`. Panel luôn bật vì đây là
                     # đường dùng để demo, chỗ mà bảng bằng chứng được nhìn kỹ nhất.
-                    runner.send_warmup(c, r)
+                    # `live` kéo dài warm-up ra thời gian thực để người xem thấy số nhích dần
+                    # trên biểu đồ; tắt thì gửi gộp cho nhanh (xem docstring `send_warmup`).
+                    runner.send_warmup(c, r, live=live, live_interval_s=live_interval_s)
+                    # Live ngủ ~40s trong warm-up, mà mốc của case được cấp từ `_run_start` chốt
+                    # TRƯỚC đó — số đo lỗi sẽ mang mốc cũ 40 giây, rơi ngoài cửa sổ quét 20 giây
+                    # và không cảnh báo nào nổ. Đã quan sát: warm-up bò đẹp tới 57°C rồi dòng
+                    # 72°C nằm ở đầu bảng, sớm hơn cả số đo nền, và bảng `alerts` trống trơn.
+                    if live:
+                        runner.advance_clock()
                     waves = runner.waves_for(c)
                     if runner.send_wave(c, r, waves[0]) and len(waves) > 1:
                         pending.append((c, r, waves))
@@ -355,7 +364,9 @@ def make_handler(panel: AnomalyPanel):
                     return self._send_json(200, panel.run_cases(
                         ids,
                         include_dangerous=bool(body.get("include_dangerous")),
-                        dry_run=bool(body.get("dry_run"))))
+                        dry_run=bool(body.get("dry_run")),
+                        live=bool(body.get("live")),
+                        live_interval_s=float(body.get("live_interval_s") or 5.0)))
                 except Exception as exc:
                     log.exception("chạy case lỗi")
                     return self._send_json(500, {"error": str(exc)})

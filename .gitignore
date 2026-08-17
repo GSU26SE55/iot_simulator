@@ -4,3 +4,7 @@ __pycache__/
 .env
 logs/
 !logs/.gitkeep
+.codegraph/
+.pytest_cache/
+.DS_Store
+*.bak-*
