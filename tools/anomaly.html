@@ -158,12 +158,10 @@ td.num{font-family:var(--mono);font-variant-numeric:tabular-nums}
     <span class="dot" id="dot"></span>
     <span class="mono" style="font-size:12px" id="connTxt">đang kết nối…</span>
     <span class="sep"></span>
-    <label class="chk"><input type="checkbox" id="dangerous"> cho phép case phá huỷ (26)</label>
     <!-- Mặc định BẬT: đây là bảng dùng để demo, và khác biệt giữa hai chế độ nằm ở chỗ người
          xem có thấy số nhích dần hay không — thứ đáng giá nhất khi trình diễn. Tắt đi khi cần
          chạy nhiều case liên tiếp cho nhanh. -->
     <label class="chk"><input type="checkbox" id="live" checked> chạy thời gian thực (số nhích dần ~1 phút)</label>
-    <button id="btnRunSel">Chạy mục đã chọn</button>
     <button id="btnRefresh">Làm mới kết quả</button>
     <button class="danger" id="btnReset">Dọn alert + ticket</button>
   </div>
@@ -272,12 +270,12 @@ async function api(path, opts){
 
 /* ── dựng danh sách case ─────────────────────────────────────────────── */
 const GROUPS = [
-  {key:'battery', title:'Nhóm 1 · lỗi pin — vượt ngưỡng đo',
-   test: c => c.kind==='sensor_reading' && !c.dangerous && !c.expect_no_anomaly},
-  {key:'env',     title:'Nhóm 2 · môi trường — cảnh báo cấp site',
-   test: c => c.kind==='ambient' || c.kind==='environmental_incident'},
-  {key:'infra',   title:'Nhóm 3 · hạ tầng — offline, chéo nguồn, toàn vẹn dữ liệu',
-   test: c => c.kind==='manual' || c.kind==='cross_source' || c.expect_no_anomaly || c.dangerous},
+  {key:'auto', title:'Demo case 1 · pin — hệ thống tự sinh ticket (auto-gen)',
+   test: c => c.id === 2 || c.id === 5},
+  {key:'env',  title:'Demo case 2 · môi trường — sự cố cấp site',
+   test: c => c.id === 21},
+  {key:'cust', title:'Demo case 3 · bơm warning nền — rồi tạo ticket tay từ phía customer',
+   test: c => c.id === 1},
 ];
 
 function sevClass(c){
@@ -321,7 +319,6 @@ function caseCard(c){
       ${pills.join(' ')}
       <span class="ctitle">${c.title||''}</span>
       <button class="primary btn-run" data-id="${c.id}">Chạy</button>
-      <input type="checkbox" class="sel" data-id="${c.id}" title="chọn để chạy hàng loạt">
     </div>
     <div class="case-body">
       ${c.note ? `<div class="why">${c.note}</div>` : ''}
@@ -387,7 +384,7 @@ async function runCases(ids){
   try{
     const r = await api('/api/run', {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ids, include_dangerous: $('#dangerous').checked, live})
+      body: JSON.stringify({ids, include_dangerous: false, live})
     });
     for(const x of r.ran){
       const codes = x.http_codes.length ? ` · HTTP ${x.http_codes.join(',')}` : '';
@@ -458,11 +455,6 @@ async function loadState(){
 
 /* ── khởi động ───────────────────────────────────────────────────────── */
 $('#btnRefresh').addEventListener('click', loadState);
-$('#btnRunSel').addEventListener('click', () => {
-  const ids = $$('.sel:checked').map(x => Number(x.dataset.id));
-  if(!ids.length){ toast('Chưa chọn case nào — tick ô vuông ở cuối dòng.'); return; }
-  runCases(ids);
-});
 $('#btnReset').addEventListener('click', async () => {
   if(!confirm('Xoá alert, breach, ticket và đóng sự cố môi trường?\nDữ liệu nền (site, pin, ngưỡng, thiết bị) giữ nguyên.')) return;
   setBusy(true, 'đang dọn…');
@@ -480,7 +472,9 @@ $('#btnReset').addEventListener('click', async () => {
 (async function init(){
   try{
     const d = await api('/api/cases');
-    CASES = d.cases; META = d.meta || {};
+    const DEMO_IDS = new Set([1, 2, 5, 21]);
+    CASES = d.cases.filter(c => DEMO_IDS.has(c.id));
+    META = d.meta || {};
     const b = CASES.find(c => c.battery);
     if(b) $('#hdrBattery').textContent = b.battery;
     $('#hdrMeta').textContent =

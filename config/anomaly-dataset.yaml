@@ -118,11 +118,23 @@ cases:
     kind: sensor_reading
     battery: BAT-2026-REAL-001
     title: Nhiệt vượt TemperatureMax + 5°C
-    note: 67 > 60 → Critical. Overheat Critical BỎ QUA luật chống nhiễu ⇒ nổ ngay từ số đo đầu tiên.
+    note: |
+      67 > 60 → Critical. Overheat Critical BỎ QUA luật chống nhiễu ⇒ nổ ngay từ số đo đầu tiên.
+      5 điểm liên tiếp, nhiệt độ NHÍCH DẦN (63→71°C) thay vì lặp y hệt 67°C — tránh trông như một
+      outlier đơn lẻ hoặc dữ liệu dựng khi trình hội đồng; pin đang DUY TRÌ và TĂNG DẦN quá nhiệt.
     repeat: 1
     bypass_noise: true
-    reading: {voltage: 25.6, current: 5.0, temperature: 67.0, soc_percent: 60, soh_percent: 90,
-              cycle_count: 250, charging_state: 3}
+    readings:
+      - {voltage: 25.6, current: 5.0, temperature: 63.0, soc_percent: 60, soh_percent: 90,
+         cycle_count: 250, charging_state: 3}
+      - {voltage: 25.6, current: 5.1, temperature: 65.5, soc_percent: 60, soh_percent: 90,
+         cycle_count: 250, charging_state: 3}
+      - {voltage: 25.5, current: 5.0, temperature: 67.0, soc_percent: 60, soh_percent: 90,
+         cycle_count: 250, charging_state: 3}
+      - {voltage: 25.5, current: 5.2, temperature: 69.0, soc_percent: 59, soh_percent: 90,
+         cycle_count: 250, charging_state: 3}
+      - {voltage: 25.4, current: 5.1, temperature: 71.0, soc_percent: 59, soh_percent: 90,
+         cycle_count: 250, charging_state: 3}
 
   - id: 3
     anomaly: Undertemp
@@ -151,8 +163,22 @@ cases:
     kind: sensor_reading
     battery: BAT-2026-REAL-001
     title: Vượt VoltageMax → luôn Critical
-    reading: {voltage: 30.5, current: 8.0, temperature: 30.0, soc_percent: 95, soh_percent: 90,
-              cycle_count: 250, charging_state: 2}
+    note: |
+      30.5V > 29,5V → Critical. Overvoltage KHÔNG nằm trong danh sách bypass_noise nên cần đủ
+      5 lần trong cửa sổ mới nổ (waves_for tự chia 5+2 đợt). Điện áp NHÍCH DẦN qua các lần đo
+      (29.6→31.2V) thay vì lặp y hệt một con số — cùng lý do với case 2: tránh trông như một
+      outlier/dữ liệu dựng khi trình hội đồng.
+    readings:
+      - {voltage: 29.6, current: 7.8, temperature: 29.5, soc_percent: 94, soh_percent: 90,
+         cycle_count: 250, charging_state: 2}
+      - {voltage: 30.0, current: 7.9, temperature: 29.8, soc_percent: 94, soh_percent: 90,
+         cycle_count: 250, charging_state: 2}
+      - {voltage: 30.5, current: 8.0, temperature: 30.0, soc_percent: 95, soh_percent: 90,
+         cycle_count: 250, charging_state: 2}
+      - {voltage: 30.8, current: 8.1, temperature: 30.2, soc_percent: 95, soh_percent: 90,
+         cycle_count: 250, charging_state: 2}
+      - {voltage: 31.2, current: 8.2, temperature: 30.4, soc_percent: 95, soh_percent: 90,
+         cycle_count: 250, charging_state: 2}
 
   - id: 6
     anomaly: Undervoltage
