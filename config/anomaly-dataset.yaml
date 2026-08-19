@@ -64,11 +64,17 @@ thresholds:
     temperature: [-10, 55]
     soc: {warning: 25, critical: 15}
     soh: {warning: 85, critical: 75}
+  # ⚠ 2026-08-17 — hạ temperature_max 60→55 và soh_critical 70→80 cho KHỚP ngưỡng hardcode
+  #   trong ai-module (`CHEMISTRY_TEMP_PROFILES["LFP"] = (45, 55)`, `EOL_SOH = 80`).
+  #   Trước đó BE và AI dùng hai bộ ngưỡng khác nhau trên CÙNG một viên pin: pin ở 57°C thì AI
+  #   kêu bất thường còn BE im lặng, và hai hệ thống nói ngược nhau ngay trên màn hình demo.
+  #   AI chưa kịp làm đường nhận ngưỡng động từ `threshold_configs`, nên DB chỉnh theo AI —
+  #   chiều ngược lại của thiết kế đúng, nhưng là chiều DUY NHẤT khả thi trong phạm vi hiện tại.
   LiFePO4-24V-30Ah:            # BAT-2026-REAL-001  ← pin DUY NHẤT có ngưỡng dòng
     voltage: [20, 29.5]
-    temperature: [-10, 60]
+    temperature: [-10, 55]
     soc: {warning: 20, critical: 10}
-    soh: {warning: 80, critical: 70}
+    soh: {warning: 85, critical: 80}
     current_max_charge: 30
     current_max_discharge: 100
     noise_suppression: {enabled: true, count: 5, window_hours: 24}
@@ -100,42 +106,54 @@ cases:
     anomaly: Overheat
     severity: Warning
     kind: sensor_reading
-    battery: BAT-2026-001
+    battery: BAT-2026-REAL-001
     title: Nhiệt vượt TemperatureMax nhưng chưa quá +5°C
-    note: 62 > 60 nhưng < 60+5=65 → Warning. Warning KHÔNG được bỏ qua luật chống nhiễu ⇒ cần đủ 5 lần.
-    reading: {voltage: 13.0, current: 5.0, temperature: 62.0, soc_percent: 60, soh_percent: 90,
+    note: 57 > 55 nhưng < 55+5=60 → Warning. Warning KHÔNG được bỏ qua luật chống nhiễu ⇒ cần đủ 5 lần.
+    reading: {voltage: 25.6, current: 5.0, temperature: 57.0, soc_percent: 60, soh_percent: 90,
               cycle_count: 250, charging_state: 3}
 
   - id: 2
     anomaly: Overheat
     severity: Critical
     kind: sensor_reading
-    battery: BAT-2026-002
+    battery: BAT-2026-REAL-001
     title: Nhiệt vượt TemperatureMax + 5°C
-    note: 72 > 65 → Critical. Overheat Critical BỎ QUA luật chống nhiễu ⇒ nổ ngay từ số đo đầu tiên.
+    note: |
+      67 > 60 → Critical. Overheat Critical BỎ QUA luật chống nhiễu ⇒ nổ ngay từ số đo đầu tiên.
+      5 điểm liên tiếp, nhiệt độ NHÍCH DẦN (63→71°C) thay vì lặp y hệt 67°C — tránh trông như một
+      outlier đơn lẻ hoặc dữ liệu dựng khi trình hội đồng; pin đang DUY TRÌ và TĂNG DẦN quá nhiệt.
     repeat: 1
     bypass_noise: true
-    reading: {voltage: 13.0, current: 5.0, temperature: 72.0, soc_percent: 60, soh_percent: 90,
-              cycle_count: 250, charging_state: 3}
+    readings:
+      - {voltage: 25.6, current: 5.0, temperature: 63.0, soc_percent: 60, soh_percent: 90,
+         cycle_count: 250, charging_state: 3}
+      - {voltage: 25.6, current: 5.1, temperature: 65.5, soc_percent: 60, soh_percent: 90,
+         cycle_count: 250, charging_state: 3}
+      - {voltage: 25.5, current: 5.0, temperature: 67.0, soc_percent: 60, soh_percent: 90,
+         cycle_count: 250, charging_state: 3}
+      - {voltage: 25.5, current: 5.2, temperature: 69.0, soc_percent: 59, soh_percent: 90,
+         cycle_count: 250, charging_state: 3}
+      - {voltage: 25.4, current: 5.1, temperature: 71.0, soc_percent: 59, soh_percent: 90,
+         cycle_count: 250, charging_state: 3}
 
   - id: 3
     anomaly: Undertemp
     severity: Warning
     kind: sensor_reading
-    battery: BAT-2026-001
+    battery: BAT-2026-REAL-001
     title: Nhiệt dưới TemperatureMin (rủi ro lithium plating khi sạc lạnh — NS-25)
     note: -12 < -10 nhưng > -10-5=-15 → Warning. `charging_state=2` vì plating xảy ra lúc SẠC.
-    reading: {voltage: 13.0, current: 2.0, temperature: -12.0, soc_percent: 60, soh_percent: 90,
+    reading: {voltage: 25.6, current: 2.0, temperature: -12.0, soc_percent: 60, soh_percent: 90,
               cycle_count: 250, charging_state: 2}
 
   - id: 4
     anomaly: Undertemp
     severity: Critical
     kind: sensor_reading
-    battery: BAT-2026-001
+    battery: BAT-2026-REAL-001
     title: Nhiệt dưới TemperatureMin - 5°C
     note: -18 < -15 → Critical. Undertemp KHÔNG nằm trong danh sách bỏ qua chống nhiễu ⇒ cần đủ 5 lần.
-    reading: {voltage: 13.0, current: 2.0, temperature: -18.0, soc_percent: 60, soh_percent: 90,
+    reading: {voltage: 25.6, current: 2.0, temperature: -18.0, soc_percent: 60, soh_percent: 90,
               cycle_count: 250, charging_state: 2}
 
   # ───────────────────────────── Điện áp ─────────────────────────────
@@ -143,19 +161,33 @@ cases:
     anomaly: Overvoltage
     severity: Critical
     kind: sensor_reading
-    battery: BAT-2026-001
+    battery: BAT-2026-REAL-001
     title: Vượt VoltageMax → luôn Critical
-    reading: {voltage: 15.2, current: 8.0, temperature: 30.0, soc_percent: 90, soh_percent: 90,
-              cycle_count: 250, charging_state: 2}
+    note: |
+      30.5V > 29,5V → Critical. Overvoltage KHÔNG nằm trong danh sách bypass_noise nên cần đủ
+      5 lần trong cửa sổ mới nổ (waves_for tự chia 5+2 đợt). Điện áp NHÍCH DẦN qua các lần đo
+      (29.6→31.2V) thay vì lặp y hệt một con số — cùng lý do với case 2: tránh trông như một
+      outlier/dữ liệu dựng khi trình hội đồng.
+    readings:
+      - {voltage: 29.6, current: 7.8, temperature: 29.5, soc_percent: 94, soh_percent: 90,
+         cycle_count: 250, charging_state: 2}
+      - {voltage: 30.0, current: 7.9, temperature: 29.8, soc_percent: 94, soh_percent: 90,
+         cycle_count: 250, charging_state: 2}
+      - {voltage: 30.5, current: 8.0, temperature: 30.0, soc_percent: 95, soh_percent: 90,
+         cycle_count: 250, charging_state: 2}
+      - {voltage: 30.8, current: 8.1, temperature: 30.2, soc_percent: 95, soh_percent: 90,
+         cycle_count: 250, charging_state: 2}
+      - {voltage: 31.2, current: 8.2, temperature: 30.4, soc_percent: 95, soh_percent: 90,
+         cycle_count: 250, charging_state: 2}
 
   - id: 6
     anomaly: Undervoltage
     severity: Critical
     kind: sensor_reading
-    battery: BAT-2026-001
+    battery: BAT-2026-REAL-001
     title: Dưới VoltageMin → luôn Critical
-    note: 9.5 < 10.5. Vẫn > 0 nên KHÔNG bị tính là outlier (outlier là V ≤ 0 hoặc > 1000).
-    reading: {voltage: 9.5, current: -3.0, temperature: 30.0, soc_percent: 40, soh_percent: 90,
+    note: 18.5 < 20.00. Vẫn > 0 nên KHÔNG bị tính là outlier (outlier là V ≤ 0 hoặc > 1000).
+    reading: {voltage: 18.5, current: -3.0, temperature: 30.0, soc_percent: 35, soh_percent: 90,
               cycle_count: 250, charging_state: 3}
 
   # ───────────────────────────── SOC ─────────────────────────────
@@ -163,21 +195,21 @@ cases:
     anomaly: LowSoc
     severity: Warning
     kind: sensor_reading
-    battery: BAT-2026-001
+    battery: BAT-2026-REAL-001
     title: SOC dưới ngưỡng cảnh báo 20% nhưng còn trên ngưỡng nguy cấp 10%
-    reading: {voltage: 11.5, current: -3.0, temperature: 30.0, soc_percent: 15, soh_percent: 90,
+    reading: {voltage: 24.0, current: -3.0, temperature: 30.0, soc_percent: 15, soh_percent: 90,
               cycle_count: 250, charging_state: 3}
 
   - id: 8
     anomaly: LowSoc
     severity: Critical
     kind: sensor_reading
-    battery: BAT-2026-003
-    title: SOC dưới ngưỡng nguy cấp (NMC 48V → ngưỡng 15%)
+    battery: BAT-2026-REAL-001
+    title: SOC dưới ngưỡng nguy cấp 10%
     note: |
       Pin NMC nên điện áp phải nằm trong 42–54,6V, KHÔNG dùng 11V như tài liệu gốc — 11V sẽ
       kích thêm Undervoltage Critical và làm lẫn kết quả demo.
-    reading: {voltage: 45.0, current: -3.0, temperature: 30.0, soc_percent: 8, soh_percent: 88,
+    reading: {voltage: 22.0, current: -3.0, temperature: 30.0, soc_percent: 8, soh_percent: 88,
               cycle_count: 400, charging_state: 3}
 
   # ───────────────────────────── Dòng điện ─────────────────────────────
@@ -186,9 +218,9 @@ cases:
     severity: Critical
     kind: sensor_reading
     battery: BAT-2026-REAL-001         # pin DUY NHẤT có current_max_discharge (100A)
-    title: Dòng xả vượt CurrentMaxDischarge (100A)
+    title: Dòng xả vượt CurrentMaxDischarge (30A)
     requires: "threshold_configs.current_max_discharge của LiFePO4 24V 30Ah phải khác NULL (hiện = 100)"
-    reading: {voltage: 24.0, current: -130.0, temperature: 35.0, soc_percent: 50, soh_percent: 90,
+    reading: {voltage: 24.0, current: -42.0, temperature: 35.0, soc_percent: 50, soh_percent: 90,
               cycle_count: 300, charging_state: 3}
 
   - id: 10
@@ -196,9 +228,9 @@ cases:
     severity: Critical
     kind: sensor_reading
     battery: BAT-2026-REAL-001         # pin DUY NHẤT có current_max_charge (30A)
-    title: Dòng sạc vượt CurrentMaxCharge (30A)
+    title: Dòng sạc vượt CurrentMaxCharge (15A)
     requires: "threshold_configs.current_max_charge của LiFePO4 24V 30Ah phải khác NULL (hiện = 30)"
-    reading: {voltage: 28.0, current: 45.0, temperature: 35.0, soc_percent: 40, soh_percent: 90,
+    reading: {voltage: 28.0, current: 22.0, temperature: 35.0, soc_percent: 40, soh_percent: 90,
               cycle_count: 300, charging_state: 2}
 
   # ───────────────────────────── SOH ─────────────────────────────
@@ -206,19 +238,19 @@ cases:
     anomaly: SohDegradation
     severity: Warning
     kind: sensor_reading
-    battery: BAT-2026-001
+    battery: BAT-2026-REAL-001
     title: SOH dưới ngưỡng cảnh báo 85% nhưng còn trên ngưỡng nguy cấp 75%
-    reading: {voltage: 12.8, current: 1.0, temperature: 32.0, soc_percent: 55, soh_percent: 82,
+    reading: {voltage: 25.6, current: 1.0, temperature: 32.0, soc_percent: 55, soh_percent: 82,
               cycle_count: 1500, charging_state: 1}
 
   - id: 12
     anomaly: SohDegradation
     severity: Critical
     kind: sensor_reading
-    battery: BAT-2026-004
+    battery: BAT-2026-REAL-001
     title: SOH dưới ngưỡng nguy cấp 75% (gần hết đời)
     note: BAT-2026-004 là NMC 48V ⇒ điện áp phải trong 42–54,6V.
-    reading: {voltage: 48.5, current: 1.0, temperature: 32.0, soc_percent: 55, soh_percent: 72,
+    reading: {voltage: 25.6, current: 1.0, temperature: 32.0, soc_percent: 55, soh_percent: 72,
               cycle_count: 1800, charging_state: 1}
 
   # ───────────────────────────── Tier 2 ─────────────────────────────
@@ -226,7 +258,7 @@ cases:
     anomaly: HighInternalResistance
     severity: Critical
     kind: sensor_reading
-    battery: BAT-2026-001
+    battery: BAT-2026-REAL-001
     title: Điện trở nội vượt ngưỡng (Tier 2 — Sprint 5B #105)
     requires: |
       threshold_configs.internal_resistance_max_milliohm HIỆN = NULL cho MỌI loại pin ⇒ luật này
@@ -234,14 +266,14 @@ cases:
         docker exec solar-postgres psql -U postgres -d battery_db -c \
           "UPDATE threshold_configs SET internal_resistance_max_milliohm = 50 WHERE is_active;"
     note: ⚠ Firmware ESP32 KHÔNG gửi trường này; chỉ backend có nhận. Đây là case chỉ simulator demo được.
-    reading: {voltage: 12.8, current: 2.0, temperature: 30.0, soc_percent: 60, soh_percent: 88,
+    reading: {voltage: 25.6, current: 2.0, temperature: 30.0, soc_percent: 60, soh_percent: 88,
               cycle_count: 400, charging_state: 1, internal_resistance_milliohm: 65}
 
   - id: 14
     anomaly: CellImbalance
     severity: Critical
     kind: sensor_reading
-    battery: BAT-2026-001
+    battery: BAT-2026-REAL-001
     title: Lệch điện áp giữa cell max và cell min (Tier 2 — Sprint 5B #105)
     requires: |
       threshold_configs.cell_voltage_delta_max_mv HIỆN = NULL cho MỌI loại pin ⇒ luật này KHÔNG
@@ -249,7 +281,7 @@ cases:
         docker exec solar-postgres psql -U postgres -d battery_db -c \
           "UPDATE threshold_configs SET cell_voltage_delta_max_mv = 100 WHERE is_active;"
     note: ⚠ Firmware ESP32 KHÔNG gửi trường này; chỉ backend có nhận.
-    reading: {voltage: 12.8, current: 2.0, temperature: 30.0, soc_percent: 60, soh_percent: 88,
+    reading: {voltage: 25.6, current: 2.0, temperature: 30.0, soc_percent: 60, soh_percent: 88,
               cycle_count: 400, charging_state: 1, cell_voltage_delta_mv: 135}
 
   # ───────────────────────────── Chéo nguồn ─────────────────────────────
@@ -257,7 +289,7 @@ cases:
     anomaly: SensorMismatch
     severity: Warning
     kind: cross_source
-    battery: BAT-2026-001
+    battery: BAT-2026-REAL-001
     title: BMS và IoT Gateway lệch nhau quá ngưỡng trong cùng cửa sổ 60s
     note: |
       Dùng `external-temp` chứ KHÔNG dùng `redundant`: backend cố ý BỎ so sánh nhiệt độ với nguồn
@@ -266,9 +298,9 @@ cases:
       Backend chỉ dựng cảnh báo cho số đo `primary` ⇒ nguồn thứ hai chỉ dùng để ghép cặp.
     repeat: 1
     readings:
-      - {source_type: 1, sensor_source_code: primary, voltage: 12.8, current: 3.0,
+      - {source_type: 1, sensor_source_code: primary, voltage: 25.6, current: 3.0,
          temperature: 30.0, soc_percent: 60, soh_percent: 90, cycle_count: 250, charging_state: 3}
-      - {source_type: 2, sensor_source_code: external-temp, voltage: 13.4, current: 3.0,
+      - {source_type: 2, sensor_source_code: external-temp, voltage: 24.9, current: 3.0,
          temperature: 36.5, soc_percent: 60, soh_percent: null, cycle_count: 250}
 
   # ───────────────────────────── Môi trường (ambient) ─────────────────────────────
@@ -428,7 +460,7 @@ cases:
     anomaly: IotDataIntegrityViolation
     severity: Critical
     kind: sensor_reading
-    battery: BAT-2026-002
+    battery: BAT-2026-REAL-001
     device_code: ESP32-SIM-002       # CỐ Ý dùng thiết bị phụ — xem `danger` bên dưới
     dangerous: true
     bypass_noise: true               # không đi qua luật chống nhiễu; 1 batch là đủ
@@ -460,7 +492,7 @@ cases:
     anomaly: bms_error_code
     severity: null
     kind: sensor_reading
-    battery: BAT-2026-001
+    battery: BAT-2026-REAL-001
     title: Trường `bmsErrorCode` đi kèm số đo — KHÔNG sinh cảnh báo riêng
     note: |
       Đây KHÔNG phải một AnomalyType. `AnomalyRules.Detect` không đọc `bmsErrorCode`; nó chỉ được

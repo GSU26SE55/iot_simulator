@@ -1,0 +1,493 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bộ case anomaly — LFP 24V 30Ah</title>
+<style>
+:root{
+  --ground:#FBFAF8; --panel:#FFFFFF; --sunk:#F3F1EC;
+  --ink:#14181D; --ink-2:#4A5462; --ink-3:#79838F;
+  --rule:#E2DFD8; --rule-2:#CFCBC2;
+  --accent:#B4761A;
+  --warn:#A8721B; --warn-bg:#FBF2DF;
+  --crit:#B23A32; --crit-bg:#FBECEA;
+  --ok:#2C7A54;  --ok-bg:#E9F4ED;
+  --info:#2F6BA8; --info-bg:#E9F1F9;
+  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+  --sans:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --ground:#0E1116; --panel:#161B22; --sunk:#1C222B;
+    --ink:#F2F5F8; --ink-2:#B3BCC8; --ink-3:#8A94A6;
+    --rule:#262D38; --rule-2:#39414E;
+    --accent:#E8A33D;
+    --warn:#D9902B; --warn-bg:#2A2113;
+    --crit:#E0524B; --crit-bg:#2C1715;
+    --ok:#3FA672;  --ok-bg:#12241B;
+    --info:#4C8FD4; --info-bg:#111F2E;
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#0E1116; --panel:#161B22; --sunk:#1C222B;
+  --ink:#F2F5F8; --ink-2:#B3BCC8; --ink-3:#8A94A6;
+  --rule:#262D38; --rule-2:#39414E;
+  --accent:#E8A33D;
+  --warn:#D9902B; --warn-bg:#2A2113;
+  --crit:#E0524B; --crit-bg:#2C1715;
+  --ok:#3FA672;  --ok-bg:#12241B;
+  --info:#4C8FD4; --info-bg:#111F2E;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--sans);
+     font-size:14.5px;line-height:1.55;-webkit-font-smoothing:antialiased}
+.wrap{max-width:1240px;margin:0 auto;padding:28px 20px 80px}
+h1{font-size:24px;margin:0;letter-spacing:-.02em;font-weight:650}
+h2{font-size:16px;margin:0;font-weight:640;letter-spacing:-.01em}
+.eyebrow{font-family:var(--mono);font-size:10.5px;letter-spacing:.14em;
+         text-transform:uppercase;color:var(--ink-3)}
+code,.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+
+header{display:flex;flex-direction:column;gap:12px;padding-bottom:18px;
+       border-bottom:2px solid var(--ink)}
+.title-row{display:flex;flex-wrap:wrap;align-items:baseline;gap:12px}
+.serial{font-family:var(--mono);font-size:12px;color:var(--accent);
+        border:1px solid var(--rule-2);border-radius:3px;padding:2px 8px}
+.lede{color:var(--ink-2);max-width:76ch;font-size:13.5px}
+
+/* ── thanh trạng thái ─────────────────────────────── */
+.bar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:14px;
+     padding:10px 12px;background:var(--panel);border:1px solid var(--rule);border-radius:6px}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--crit);flex:0 0 auto}
+.dot.up{background:var(--ok)}
+.bar .sep{flex:1}
+button{font-family:inherit;font-size:13px;font-weight:500;border-radius:5px;
+       padding:6px 12px;cursor:pointer;border:1px solid var(--rule-2);
+       background:var(--panel);color:var(--ink)}
+button:hover:not(:disabled){border-color:var(--accent);color:var(--accent)}
+button:disabled{opacity:.45;cursor:not-allowed}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button.primary:hover:not(:disabled){opacity:.88;color:#fff}
+button.danger{color:var(--crit);border-color:var(--crit)}
+button.danger:hover:not(:disabled){background:var(--crit-bg)}
+label.chk{display:inline-flex;align-items:center;gap:6px;font-size:12.5px;color:var(--ink-2)}
+
+/* ── bố cục ───────────────────────────────────────── */
+.cols{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(0,1fr);gap:20px;margin-top:22px}
+@media (max-width:980px){.cols{grid-template-columns:1fr}}
+section{display:flex;flex-direction:column;gap:10px}
+.sec-head{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+.sec-head .sep{flex:1}
+
+/* ── nhóm case ────────────────────────────────────── */
+.group-title{font-family:var(--mono);font-size:10.5px;letter-spacing:.12em;
+             text-transform:uppercase;color:var(--ink-3);margin:14px 0 2px}
+.case{background:var(--panel);border:1px solid var(--rule);border-radius:5px;
+      border-left:3px solid var(--rule-2);overflow:hidden}
+.case.crit{border-left-color:var(--crit)}
+.case.warn{border-left-color:var(--warn)}
+.case.info{border-left-color:var(--info)}
+.case-head{display:flex;flex-wrap:wrap;align-items:center;gap:9px;padding:9px 12px;cursor:pointer}
+.case-head:hover{background:var(--sunk)}
+.cid{font-family:var(--mono);font-size:11.5px;font-weight:600;color:var(--ink-3);
+     min-width:22px;text-align:right}
+.ctype{font-family:var(--mono);font-size:13px;font-weight:600}
+.ctitle{color:var(--ink-2);font-size:12.5px;flex:1 1 200px;min-width:0;
+        overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pill{display:inline-block;font-family:var(--mono);font-size:10px;font-weight:600;
+      letter-spacing:.05em;text-transform:uppercase;padding:1px 6px;border-radius:2px;
+      white-space:nowrap;border:1px solid}
+.pill.crit{color:var(--crit);background:var(--crit-bg);border-color:var(--crit)}
+.pill.warn{color:var(--warn);background:var(--warn-bg);border-color:var(--warn)}
+.pill.ok{color:var(--ok);background:var(--ok-bg);border-color:var(--ok)}
+.pill.info{color:var(--info);background:var(--info-bg);border-color:var(--info)}
+.pill.mute{color:var(--ink-3);background:var(--sunk);border-color:var(--rule-2)}
+.case-body{padding:0 12px 12px;display:none;flex-direction:column;gap:9px}
+.case.open .case-body{display:flex}
+.why{font-size:12.5px;color:var(--ink-2);white-space:pre-wrap}
+pre{margin:0;padding:9px 11px;background:var(--sunk);border-radius:3px;overflow-x:auto;
+    font-family:var(--mono);font-size:11.5px;line-height:1.5;color:var(--ink-2);
+    font-variant-numeric:tabular-nums}
+.k{color:var(--ink-3)} .v{color:var(--accent);font-weight:600}
+.flags{display:flex;flex-wrap:wrap;gap:6px}
+.run-out{font-family:var(--mono);font-size:11.5px;padding:7px 10px;border-radius:3px;
+         border:1px solid var(--rule);white-space:pre-wrap}
+.run-out.ok{background:var(--ok-bg);border-color:var(--ok);color:var(--ok)}
+.run-out.bad{background:var(--crit-bg);border-color:var(--crit);color:var(--crit)}
+.run-out.mute{background:var(--sunk);color:var(--ink-2)}
+
+/* ── bảng kết quả ─────────────────────────────────── */
+.scroll{overflow-x:auto;border:1px solid var(--rule);border-radius:5px;background:var(--panel)}
+table{border-collapse:collapse;width:100%;font-size:12.5px}
+th,td{padding:6px 10px;text-align:left;border-bottom:1px solid var(--rule);white-space:nowrap}
+thead th{font-family:var(--mono);font-size:10px;letter-spacing:.09em;text-transform:uppercase;
+         color:var(--ink-3);background:var(--sunk);border-bottom:1px solid var(--rule-2);font-weight:500}
+tbody tr:last-child td{border-bottom:none}
+td.num{font-family:var(--mono);font-variant-numeric:tabular-nums}
+.empty{padding:14px;color:var(--ink-3);font-size:12.5px;text-align:center}
+.note{background:var(--sunk);border-left:3px solid var(--accent);padding:10px 12px;
+      font-size:12.5px;color:var(--ink-2);border-radius:0 3px 3px 0}
+.note b{color:var(--ink)}
+#toast{position:fixed;right:18px;bottom:18px;background:var(--panel);color:var(--ink);
+       border:1px solid var(--rule-2);border-left:3px solid var(--accent);border-radius:5px;
+       padding:10px 14px;font-size:13px;box-shadow:0 6px 24px rgba(0,0,0,.18);
+       opacity:0;transform:translateY(8px);transition:.18s;pointer-events:none;max-width:380px}
+#toast.show{opacity:1;transform:none}
+.spin{display:inline-block;width:11px;height:11px;border:2px solid var(--rule-2);
+      border-top-color:var(--accent);border-radius:50%;animation:sp .7s linear infinite;
+      vertical-align:-1px}
+@keyframes sp{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div class="title-row">
+    <h1>Bộ case anomaly</h1>
+    <span class="serial" id="hdrBattery">BAT-2026-REAL-001</span>
+    <span class="eyebrow" id="hdrMeta">—</span>
+  </div>
+  <p class="lede">
+    Bấm <b>Chạy</b> ở từng case để đẩy đúng số đo của case đó lên backend. Mỗi lần chạy dùng lại
+    <code>AnomalyRunner</code> của CLI nên payload ra dây giống hệt <code>--case N</code>.
+    Case cần vượt ngưỡng chống nhiễu sẽ tự chia hai đợt và chờ giữa hai đợt — đừng đóng tab lúc đang chạy.
+  </p>
+  <div class="bar">
+    <span class="dot" id="dot"></span>
+    <span class="mono" style="font-size:12px" id="connTxt">đang kết nối…</span>
+    <span class="sep"></span>
+    <!-- Mặc định BẬT: đây là bảng dùng để demo, và khác biệt giữa hai chế độ nằm ở chỗ người
+         xem có thấy số nhích dần hay không — thứ đáng giá nhất khi trình diễn. Tắt đi khi cần
+         chạy nhiều case liên tiếp cho nhanh. -->
+    <label class="chk"><input type="checkbox" id="live" checked> chạy thời gian thực (số nhích dần ~1 phút)</label>
+    <button id="btnRefresh">Làm mới kết quả</button>
+    <button class="danger" id="btnReset">Dọn alert + ticket</button>
+  </div>
+</header>
+
+<div class="cols">
+  <!-- ─────────── cột trái: danh sách case ─────────── -->
+  <section>
+    <div class="sec-head">
+      <h2>Danh sách case</h2>
+      <span class="sep"></span>
+      <span class="eyebrow" id="caseCount">—</span>
+    </div>
+    <div class="note">
+      Chỉ cảnh báo <b>Critical</b> mới sinh ticket. Warning đi đường
+      <code>BatteryAnomalyWarningDetectedEvent</code> — chỉ notification.
+      Nên case 01 và 07 có alert nhưng <b>không</b> có ticket.
+      <br>
+      Khử trùng <b>30 phút</b> theo (pin, loại lỗi) — chạy lại CÙNG loại lỗi trong 30' thì
+      cảnh báo sau bị gộp, trừ khi nó nghiêm trọng hơn cảnh báo đang mở.
+    </div>
+    <!-- Ngưỡng in thẳng ở đây thay vì để người demo tự tra DB: BE và AI dùng CHUNG bộ số này,
+         và nếu chúng lệch nhau thì cùng một viên pin sẽ được hai hệ thống chấm khác nhau ngay
+         trên màn hình. Đổi ngưỡng trong `threshold_configs` thì phải sửa cả khối này. -->
+    <div class="note">
+      <b>Ngưỡng BAT-2026-REAL-001</b> (LiFePO4 24V 30Ah) — khớp giữa backend và ai-module:
+      nhiệt <b>−10…55°C</b> · áp <b>20,0–29,2V</b> · SOC <b>20/10%</b> ·
+      SOH <b>85/80%</b> · dòng <b>15A sạc / 30A xả</b>.
+      Warning khi vượt ngưỡng, Critical khi vượt thêm 5 đơn vị.
+    </div>
+    <div id="cases"></div>
+  </section>
+
+  <!-- ─────────── cột phải: kết quả ─────────── -->
+  <section>
+    <div class="sec-head">
+      <h2>Kết quả trong DB</h2>
+      <span class="sep"></span>
+      <span class="eyebrow" id="stateAt">—</span>
+    </div>
+
+    <div class="sec-head" style="margin-top:4px"><span class="eyebrow">Cảnh báo</span></div>
+    <div class="scroll"><table>
+      <thead><tr><th>Pin</th><th>Loại</th><th>Mức</th><th>Ngưỡng</th><th>Thực tế</th><th>Lúc</th></tr></thead>
+      <tbody id="tbAlerts"><tr><td colspan="6" class="empty">chưa có</td></tr></tbody>
+    </table></div>
+
+    <div class="sec-head" style="margin-top:10px"><span class="eyebrow">Ticket tự sinh</span></div>
+    <div class="scroll"><table>
+      <thead><tr><th>Mã</th><th>Tiêu đề</th><th>Trạng thái</th><th>Ưu tiên</th><th>AI</th><th>Lúc</th></tr></thead>
+      <tbody id="tbTickets"><tr><td colspan="6" class="empty">chưa có</td></tr></tbody>
+    </table></div>
+
+    <div class="sec-head" style="margin-top:10px">
+      <span class="eyebrow">Bộ đếm chống nhiễu</span>
+      <span class="sep"></span>
+      <span class="eyebrow">nổ khi ≥ 5</span>
+    </div>
+    <div class="scroll"><table>
+      <thead><tr><th>Pin</th><th>Loại</th><th>Số lần</th></tr></thead>
+      <tbody id="tbBreach"><tr><td colspan="3" class="empty">chưa có</td></tr></tbody>
+    </table></div>
+
+    <div class="sec-head" style="margin-top:10px"><span class="eyebrow">Sự cố môi trường · Saga</span></div>
+    <div class="scroll"><table>
+      <thead><tr><th>Mục</th><th>Chi tiết</th></tr></thead>
+      <tbody id="tbMisc"><tr><td colspan="2" class="empty">chưa có</td></tr></tbody>
+    </table></div>
+  </section>
+</div>
+
+</div>
+<div id="toast"></div>
+
+<script>
+const $  = (s, r=document) => r.querySelector(s);
+const $$ = (s, r=document) => Array.from(r.querySelectorAll(s));
+
+// Enum của backend — để bảng đọc được thay vì trơ ra con số.
+const ANOMALY = {1:'Overheat',2:'Overvoltage',3:'Undervoltage',4:'LowSoc',5:'RapidDischarge',
+  6:'AbnormalCharging',7:'DeviceOffline',8:'SohDegradation',9:'HighAmbientTemp',10:'HighHumidity',
+  11:'HighTempHumidityCombo',12:'HighInternalResistance',13:'CellImbalance',
+  14:'EnvironmentalIncident',15:'SensorMismatch',16:'Undertemp',17:'IotDataIntegrityViolation'};
+const SEV      = {1:'Info',2:'Warning',3:'Critical'};
+const ALERT_ST = {1:'Open',2:'Acknowledged',3:'Resolved',4:'Merged'};
+const TK_ST    = {1:'New',2:'Open',3:'Assigned',4:'InProgress',5:'Pending',6:'Resolved',7:'Closed'};
+const TK_PRIO  = {1:'Critical',2:'High',3:'Medium',4:'Low'};
+const INC_TYPE = {1:'Smoke',2:'FireDetected',3:'GasLeak',4:'Flood',5:'OverheatHazard'};
+const INC_ST   = {1:'Open',2:'Acknowledged',3:'Resolved'};
+
+let CASES = [], META = {}, busy = false;
+
+function toast(msg, ms=2600){
+  const t = $('#toast'); t.textContent = msg; t.classList.add('show');
+  clearTimeout(t._t); t._t = setTimeout(()=>t.classList.remove('show'), ms);
+}
+function conn(up, txt){
+  $('#dot').classList.toggle('up', up);
+  $('#connTxt').textContent = txt;
+}
+async function api(path, opts){
+  const res = await fetch(path, opts);
+  if(!res.ok) throw new Error(`HTTP ${res.status} — ${(await res.text()).slice(0,200)}`);
+  return res.json();
+}
+
+/* ── dựng danh sách case ─────────────────────────────────────────────── */
+const GROUPS = [
+  {key:'auto', title:'Demo case 1 · pin — hệ thống tự sinh ticket (auto-gen)',
+   test: c => c.id === 2 || c.id === 5},
+  {key:'env',  title:'Demo case 2 · môi trường — sự cố cấp site',
+   test: c => c.id === 21},
+  {key:'cust', title:'Demo case 3 · bơm warning nền — rồi tạo ticket tay từ phía customer',
+   test: c => c.id === 1},
+];
+
+function sevClass(c){
+  if(c.expect_no_anomaly) return 'info';
+  return c.severity === 'Critical' ? 'crit' : c.severity === 'Warning' ? 'warn' : 'info';
+}
+function readingHtml(c){
+  const rows = [];
+  const fmt = o => Object.entries(o)
+      .map(([k,v]) => `<span class="k">${k}</span> <span class="v">${v}</span>`).join('  ');
+  if(c.reading)  rows.push(fmt(c.reading));
+  if(c.readings) c.readings.forEach((r,i)=>rows.push(`<span class="k">nguồn ${i+1}</span>  ${fmt(r)}`));
+  if(c.ambient)  rows.push(`<span class="k">POST</span> /api/ambient/readings/batch\n${fmt(c.ambient)}`);
+  if(c.incident) rows.push(`<span class="k">POST</span> /api/environmental-incidents\n${fmt(c.incident)}`);
+  return rows.length ? `<pre>${rows.join('\n')}</pre>` : '';
+}
+function caseCard(c){
+  const el = document.createElement('div');
+  el.className = `case ${sevClass(c)}`;
+  el.dataset.id = c.id;
+
+  const pills = [];
+  if(c.severity)          pills.push(`<span class="pill ${sevClass(c)}">${c.severity}</span>`);
+  if(c.expect_no_anomaly) pills.push(`<span class="pill mute">không alert</span>`);
+  if(c.makes_ticket)      pills.push(`<span class="pill ok">ticket</span>`);
+  if(c.bypass_noise)      pills.push(`<span class="pill info">nổ ngay</span>`);
+  if(c.kind==='manual')   pills.push(`<span class="pill mute">chạy tay</span>`);
+  if(c.dangerous)         pills.push(`<span class="pill crit">phá huỷ</span>`);
+  if(c.conflicts_with)    pills.push(`<span class="pill warn">xung đột ${c.conflicts_with}</span>`);
+
+  const flags = [];
+  if(!c.single_shot && c.kind==='sensor_reading' && !c.bypass_noise)
+    flags.push(`<span class="pill mute">repeat ${c.repeat} · chia 2 đợt</span>`);
+  if(c.single_shot) flags.push(`<span class="pill mute">1 lần · miễn chống nhiễu</span>`);
+  if(c.battery)     flags.push(`<span class="pill mute">${c.battery}</span>`);
+
+  el.innerHTML = `
+    <div class="case-head">
+      <span class="cid">${String(c.id).padStart(2,'0')}</span>
+      <span class="ctype">${c.anomaly}</span>
+      ${pills.join(' ')}
+      <span class="ctitle">${c.title||''}</span>
+      <button class="primary btn-run" data-id="${c.id}">Chạy</button>
+    </div>
+    <div class="case-body">
+      ${c.note ? `<div class="why">${c.note}</div>` : ''}
+      ${c.requires ? `<div class="note"><b>Cần cấu hình:</b> ${c.requires}</div>` : ''}
+      ${readingHtml(c)}
+      <div class="flags">${flags.join(' ')}</div>
+      <div class="run-out mute" data-out="${c.id}" hidden></div>
+    </div>`;
+
+  // Bấm vào đầu thẻ để mở/đóng — trừ khi bấm trúng nút hoặc ô chọn.
+  el.querySelector('.case-head').addEventListener('click', ev => {
+    if(ev.target.closest('button, input')) return;
+    el.classList.toggle('open');
+  });
+  el.querySelector('.btn-run').addEventListener('click', () => runCases([c.id]));
+  return el;
+}
+
+function renderCases(){
+  const host = $('#cases'); host.innerHTML = '';
+  const used = new Set();
+  for(const g of GROUPS){
+    const items = CASES.filter(c => !used.has(c.id) && g.test(c));
+    items.forEach(c => used.add(c.id));
+    if(!items.length) continue;
+    const h = document.createElement('div');
+    h.className = 'group-title'; h.textContent = g.title;
+    host.appendChild(h);
+    items.sort((a,b)=>a.id-b.id).forEach(c => host.appendChild(caseCard(c)));
+  }
+  $('#caseCount').textContent = `${CASES.length} case`;
+}
+
+/* ── chạy case ───────────────────────────────────────────────────────── */
+function setBusy(on, label){
+  busy = on;
+  $$('button').forEach(b => b.disabled = on);
+  if(on) conn(true, label || 'đang chạy…');
+}
+function showOut(id, cls, text){
+  const el = $(`[data-out="${id}"]`);
+  if(!el) return;
+  el.hidden = false; el.className = `run-out ${cls}`; el.textContent = text;
+  el.closest('.case').classList.add('open');
+}
+
+async function runCases(ids){
+  if(busy) return;
+  const needWave = ids.some(i => {
+    const c = CASES.find(x=>x.id===i);
+    return c && c.kind==='sensor_reading' && !c.bypass_noise && !c.expect_no_anomaly;
+  });
+  const gap = META.wave_gap_s || 14;
+  const live = $('#live').checked;
+  // Live gửi 12 số đo nền cách nhau 5 giây ⇒ ~55s CHO MỖI case, cộng dồn khi chọn nhiều mục.
+  // Không nói trước con số này thì người dùng tưởng bảng treo và bấm lại lần nữa.
+  const liveSecs = live ? Math.round(ids.length * 55) : 0;
+  setBusy(true,
+    live ? `đang chạy thời gian thực — số nhích dần, ~${liveSecs}s…`
+         : (needWave ? `đang chạy — có đợt 2, chờ ${gap}s…` : 'đang chạy…'));
+  ids.forEach(i => showOut(i, 'mute', live ? 'đang gửi số đo nền theo thời gian thực…' : 'đang gửi…'));
+
+  try{
+    const r = await api('/api/run', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ids, include_dangerous: false, live})
+    });
+    for(const x of r.ran){
+      const codes = x.http_codes.length ? ` · HTTP ${x.http_codes.join(',')}` : '';
+      if(x.status === 'OK'){
+        showOut(x.id, 'ok',
+          `✓ gửi ${x.sent} reading · backend nhận ${x.inserted}, bỏ ${x.skipped}${codes}` +
+          (x.detail ? `\n${x.detail}` : ''));
+      }else if(x.status === 'MANUAL'){
+        showOut(x.id, 'mute', `CHẠY TAY:\n${x.detail}`);
+      }else{
+        showOut(x.id, 'bad', `✗ ${x.status}: ${x.detail}${codes}`);
+      }
+    }
+    r.blocked_dangerous.forEach(i =>
+      showOut(i, 'bad', '✗ bị giữ lại — tick "cho phép case phá huỷ" nếu thật sự muốn chạy'));
+    r.conflicting.forEach(x =>
+      showOut(x.id, 'bad', `⊘ trùng khoá khử trùng với case ${x.conflicts_with} — chạy riêng`));
+
+    const ok = r.ran.filter(x=>x.status==='OK').length;
+    toast(`Đã chạy ${ok}/${r.ran.length} case. Chờ ~25s cho bộ quét rồi bấm "Làm mới kết quả".`, 5000);
+  }catch(e){
+    ids.forEach(i => showOut(i, 'bad', `✗ ${e.message}`));
+    toast(`Lỗi: ${e.message}`, 5000);
+  }finally{
+    setBusy(false);
+    conn(true, 'sẵn sàng');
+    setTimeout(loadState, 1200);
+  }
+}
+
+/* ── bảng kết quả ────────────────────────────────────────────────────── */
+const td = (v, cls='') => `<td${cls?` class="${cls}"`:''}>${v ?? ''}</td>`;
+function fill(tbody, rows, cols){
+  const el = $(tbody);
+  if(!rows.length){ el.innerHTML = `<tr><td colspan="${cols}" class="empty">chưa có</td></tr>`; return; }
+  el.innerHTML = rows.join('');
+}
+async function loadState(){
+  try{
+    const s = await api('/api/state');
+    $('#stateAt').textContent = `cập nhật ${s.at} UTC`;
+
+    fill('#tbAlerts', s.alerts.map(a => `<tr>
+      ${td(a.battery)}${td(ANOMALY[a.type]||a.type)}
+      ${td(`<span class="pill ${a.severity==='3'?'crit':a.severity==='2'?'warn':'info'}">${SEV[a.severity]||a.severity}</span>`)}
+      ${td(a.threshold, 'num')}${td(a.actual, 'num')}${td(a.at, 'num')}</tr>`), 6);
+
+    fill('#tbTickets', s.tickets.map(t => `<tr>
+      ${td(`<code>${t.code}</code>`)}${td(t.title)}
+      ${td(TK_ST[t.status]||t.status)}${td(TK_PRIO[t.priority]||t.priority)}
+      ${td(t.ai_suggestions, 'num')}${td(t.at, 'num')}</tr>`), 6);
+
+    fill('#tbBreach', s.breaches.map(b => `<tr>
+      ${td(b.battery)}${td(ANOMALY[b.type]||b.type)}
+      ${td(`<b class="${b.count>=5?'':''}">${b.count}</b> / 5`, 'num')}</tr>`), 3);
+
+    const misc = [];
+    s.incidents.forEach(i => misc.push(`<tr>${td('sự cố')}
+      ${td(`${INC_TYPE[i.type]||i.type} · ${SEV[i.severity]||i.severity} · ${INC_ST[i.status]||i.status} · ${i.at}`)}</tr>`));
+    s.sagas.forEach(g => misc.push(`<tr>${td('saga')}${td(`${g.state} × ${g.count}`)}</tr>`));
+    fill('#tbMisc', misc, 2);
+
+    conn(true, 'sẵn sàng');
+  }catch(e){
+    conn(false, `mất kết nối: ${e.message}`);
+  }
+}
+
+/* ── khởi động ───────────────────────────────────────────────────────── */
+$('#btnRefresh').addEventListener('click', loadState);
+$('#btnReset').addEventListener('click', async () => {
+  if(!confirm('Xoá alert, breach, ticket và đóng sự cố môi trường?\nDữ liệu nền (site, pin, ngưỡng, thiết bị) giữ nguyên.')) return;
+  setBusy(true, 'đang dọn…');
+  try{
+    const r = await api('/api/reset', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({scope:'all'})
+    });
+    toast('Đã dọn: ' + r.reset.join(' · '), 4000);
+    $$('[data-out]').forEach(el => el.hidden = true);
+  }catch(e){ toast(`Lỗi: ${e.message}`, 5000); }
+  finally{ setBusy(false); loadState(); }
+});
+
+(async function init(){
+  try{
+    const d = await api('/api/cases');
+    const DEMO_IDS = new Set([1, 2, 5, 21]);
+    CASES = d.cases.filter(c => DEMO_IDS.has(c.id));
+    META = d.meta || {};
+    const b = CASES.find(c => c.battery);
+    if(b) $('#hdrBattery').textContent = b.battery;
+    $('#hdrMeta').textContent =
+      `quét ${META.scan_interval_s}s · nhìn lại ${META.scan_lookback_s}s · ` +
+      `gộp ${META.alert_dedup_window_min}′ · chống nhiễu ${META.noise_suppression_count} lần`;
+    renderCases();
+    conn(true, 'sẵn sàng');
+  }catch(e){
+    conn(false, `không tải được danh sách case: ${e.message}`);
+  }
+  loadState();
+  setInterval(() => { if(!busy) loadState(); }, 10000);
+})();
+</script>
+</body>
+</html>

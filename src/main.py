@@ -29,6 +29,7 @@ except ImportError:  # pragma: no cover - phụ thuộc môi trường
     pass
 
 from .config import CONTRACT_IOT2, load_config
+from .control_server import start_control_server
 from .dashboard import run_dashboard
 from .device import SimulatedDevice
 
@@ -49,6 +50,9 @@ def parse_args() -> argparse.Namespace:
                         "trạng thái OTA) trước khi chạy — tương đương `clear` trên Serial CLI")
     p.add_argument("--no-persist", action="store_true",
                    help="không ghi state ra đĩa (mỗi lần chạy là một thiết bị mới tinh)")
+    p.add_argument("--control-port", type=int, default=8787,
+                   help="cổng HTTP control server cục bộ để chỉnh thông số lúc đang chạy "
+                        "(dùng với control.html); 0 = tắt (mặc định 8787)")
     return p.parse_args()
 
 
@@ -123,6 +127,14 @@ def main() -> int:
 
     for d in devices:
         d.start()
+
+    if args.control_port:
+        try:
+            start_control_server(devices, port=args.control_port)
+            log.info("control server sẵn sàng — mở tools/control.html để chỉnh thông số")
+        except OSError as ex:
+            log.warning("không khởi động được control server tại cổng %d: %s",
+                        args.control_port, ex)
 
     if args.once:
         deadline = time.time() + 60

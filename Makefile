@@ -6,10 +6,12 @@ ACT := . $(VENV)/bin/activate
 MOCK_PORT ?= 4099
 
 .PHONY: help venv install run demo once test lint mock mock-ota provision clean clean-state \
-        anomaly anomaly-list anomaly-check anomaly-verify anomaly-dry
+        anomaly anomaly-list anomaly-check anomaly-verify anomaly-dry anomaly-panel
 
 # Backend dùng cho bộ dataset anomaly (mặc định ApiGateway ở cổng 4001).
 BACKEND ?= http://localhost:4001
+# Cổng bảng điều khiển web của bộ case (tools/anomaly.html).
+PANEL_PORT ?= 8099
 
 help:
 	@echo "Targets:"
@@ -31,6 +33,7 @@ help:
 	@echo "  make anomaly-dry    in payload thật sẽ gửi, KHÔNG gửi"
 	@echo "  make anomaly        chạy lượt thường (~90s: 2 đợt + tách cặp chéo nguồn)"
 	@echo "  make anomaly-verify in câu SQL kiểm chứng + dọn để demo lại"
+	@echo "  make anomaly-panel  MỞ BẢNG ĐIỀU KHIỂN web — bấm chạy từng case ($(PANEL_PORT))"
 	@echo "  (case 24/25 loại trừ 17/18, case 26 nguy hiểm — bộ chạy tự in cách chạy riêng)"
 
 venv:
@@ -83,3 +86,8 @@ clean-state:
 
 clean:
 	rm -rf $(VENV) logs/state logs/queue/*.jsonl
+
+# Bảng điều khiển web: bấm chạy TỪNG case, xem alert/ticket sinh ra ngay trong trình duyệt.
+# Dùng lại đúng AnomalyRunner của CLI nên payload ra dây không khác `make anomaly`.
+anomaly-panel:
+	$(ACT) && IOT_BASE_URL=$(BACKEND) python -m src.anomaly_server --port $(PANEL_PORT)
